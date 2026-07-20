@@ -64,10 +64,26 @@ class OnlineRanker:
         self.mu = np.zeros(N_FEATURES, dtype=np.float32)
         self.var = np.ones(N_FEATURES, dtype=np.float32)
         self.n_norm = 0
-        # Online AUC bookkeeping: pairwise win-rates of learner vs heuristic.
+        # Blend gate bookkeeping — a McNemar paired test of learner-vs-
+        # heuristic on the SAME pairs. We count only DISCORDANT pairs (exactly
+        # one of the two ranked it correctly): `disc_b` = learner right &
+        # heuristic wrong, `disc_c` = the reverse. Concordant pairs (both right
+        # or both wrong) carry no comparative signal and would otherwise let a
+        # learner that merely echoes the heuristic — or overfits noise — look
+        # like it wins. The gate opens only when the Wilson lower bound of
+        # b/(b+c) clears 0.5, i.e. the learner is STATISTICALLY better, not
+        # just numerically ahead. Decayed so the test reflects recent skill.
         self.events = 0
-        self.wins_learner = 0.0
-        self.wins_heuristic = 0.0
+        self.disc_b = 0.0  # learner correct, heuristic wrong
+        self.disc_c = 0.0  # heuristic correct, learner wrong
+        # Shorter decay → smaller effective-n → a more conservative Wilson
+        # bound. This is the defense against LABEL-NOISE MEMORIZATION: when the
+        # same candidate pairs recur under random feedback the learner can
+        # memorize their accidental labels and edge ~55% on discordant pairs;
+        # keeping effective-n modest means that thin edge never clears a 99.9%
+        # confidence bound, while a genuine signal (win-rate → 1.0) clears it
+        # immediately.
+        self.gate_decay = 0.99
 
     # ── normalization ────────────────────────────────────────────────
     def observe(self, x: np.ndarray) -> None:
@@ -93,17 +109,38 @@ class OnlineRanker:
         h = self._gelu(z @ W1 + b1)
         return float(h @ W2 + b2)
 
+    @staticmethod
+    def _wilson_lower(successes: float, n: float, z: float = 3.0) -> float:
+        """Wilson score lower bound for a binomial proportion (z=3.0 ≈ 99.9%).
+
+        Answers 'is the true win-rate confidently above p?' with small-sample
+        correctness — a raw ratio of 51% over thousands of noisy trials would
+        pass a naive threshold but fails this."""
+        if n <= 0:
+            return 0.0
+        p = successes / n
+        denom = 1.0 + z * z / n
+        center = p + z * z / (2 * n)
+        margin = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+        return (center - margin) / denom
+
     @property
     def blend(self) -> float:
-        """λ — how much the learned score participates."""
+        """λ — how much the learned score participates.
+
+        Opens only when a McNemar paired test says the learner beats the
+        heuristic with statistical confidence (Wilson lower bound of the
+        discordant win-rate > 0.5), never on a numerical lead alone."""
         if self.events < self.blend_min_events:
             return 0.0
-        total = self.wins_learner + self.wins_heuristic
-        if total < 20 or self.wins_learner <= self.wins_heuristic:
+        disc = self.disc_b + self.disc_c
+        if disc < 20:
             return 0.0
-        # Scale with the margin, capped: clearly-better learner → up to 0.7.
-        margin = (self.wins_learner - self.wins_heuristic) / total
-        return float(min(0.7, 2.0 * margin))
+        lower = self._wilson_lower(self.disc_b, disc)
+        if lower <= 0.5:
+            return 0.0
+        # Map the confidence margin above 0.5 to λ ∈ (0, 0.7].
+        return float(min(0.7, 4.0 * (lower - 0.5)))
 
     def score(self, x: np.ndarray) -> float:
         z = self._z(x)
@@ -120,12 +157,17 @@ class OnlineRanker:
         Also referees learner-vs-heuristic on this pair for the blend gate.
         Returns the pairwise loss (pre-update)."""
         zp, zn = self._z(x_pos), self._z(x_neg)
-        # Referee BEFORE updating (out-of-sample for the learner).
+        # Referee BEFORE updating (out-of-sample for the learner). McNemar:
+        # count only the DISCORDANT pairs — exactly one ranker got it right.
         self.events += 1
-        if self._mlp(zp) > self._mlp(zn):
-            self.wins_learner += 1
-        if float(_HEURISTIC_W @ zp) > float(_HEURISTIC_W @ zn):
-            self.wins_heuristic += 1
+        learner_ok = self._mlp(zp) > self._mlp(zn)
+        heur_ok = float(_HEURISTIC_W @ zp) > float(_HEURISTIC_W @ zn)
+        if learner_ok != heur_ok:
+            self.disc_b = self.disc_b * self.gate_decay + (1.0 if learner_ok else 0.0)
+            self.disc_c = self.disc_c * self.gate_decay + (0.0 if learner_ok else 1.0)
+        else:
+            self.disc_b *= self.gate_decay
+            self.disc_c *= self.gate_decay
 
         # Forward on live (non-EMA) weights.
         hp = self._gelu(zp @ self.W1 + self.b1)
@@ -176,7 +218,7 @@ class OnlineRanker:
             mu=self.mu, var=self.var,
             meta=json.dumps({
                 "n_norm": self.n_norm, "events": self.events,
-                "wins_learner": self.wins_learner, "wins_heuristic": self.wins_heuristic,
+                "disc_b": self.disc_b, "disc_c": self.disc_c,
                 "lr": self.lr, "l2": self.l2, "blend_min_events": self.blend_min_events,
             }),
         )
@@ -193,14 +235,16 @@ class OnlineRanker:
         r.mu, r.var = data["mu"], data["var"]
         r.n_norm = meta["n_norm"]
         r.events = meta["events"]
-        r.wins_learner = meta["wins_learner"]
-        r.wins_heuristic = meta["wins_heuristic"]
+        r.disc_b = meta.get("disc_b", 0.0)
+        r.disc_c = meta.get("disc_c", 0.0)
         return r
 
     def stats(self) -> Dict[str, float]:
+        disc = self.disc_b + self.disc_c
         return {
             "events": float(self.events),
             "blend": self.blend,
-            "wins_learner": self.wins_learner,
-            "wins_heuristic": self.wins_heuristic,
+            "disc_b": self.disc_b,
+            "disc_c": self.disc_c,
+            "win_rate": self.disc_b / disc if disc > 0 else 0.0,
         }

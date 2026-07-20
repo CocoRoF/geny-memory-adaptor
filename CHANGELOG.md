@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.1.0] — 2026-07-20
+
+Deep-validation hardening — three real defects found by indexing **939 live
+Geny prod agent notes** and stress-testing the learning loop, plus a
+statistically-principled blend gate.
+
+### Fixed
+- **feedback() re-serialized the 32 MB embedding table every call** (zlib
+  compress dominated at 14 s / 20 feedbacks). The embedding table is static
+  between distills — feedback now persists ONLY the ~1 KB ranker. **~200×
+  faster: 0.85 s → 4 ms per feedback.**
+- **Blend gate could open on label noise** (numeric win-lead of ~51% over
+  thousands of noisy feedbacks). Replaced the win-count heuristic with a
+  **McNemar paired test on discordant pairs + a Wilson 99.9% lower bound**
+  (decayed so it tracks recent skill). Random feedback now keeps λ=0; a
+  genuine signal opens it immediately. Verified: 17,600 random feedbacks →
+  blend 0.00; genuine preference → blend 0.70 at feedback #1.
+- **Meta tags densified the graph toward a clique** (real vaults tag nearly
+  every note `execution`/`success`; PPR then dominated query latency).
+  Tag-edge derivation now drops tags present on >30% of the corpus — no
+  topical signal, and it restores fast PPR. Real-vault natural-query latency
+  ~5–14 ms at 939 notes.
+
+### Added
+- `eval/real_vault.py` (index real Obsidian-format agent notes),
+  `eval/learning_sim.py` (4 ground-truth learning scenarios),
+  `eval/ablation.py`. Two regression guards: blend-gate noise resistance and
+  feedback-loop speed.
+
+
 ## [1.0.0] — 2026-07-20
 
 Korean-first upgrade — evidence-based, measured on a committed MIRACL-ko

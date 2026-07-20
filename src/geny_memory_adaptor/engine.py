@@ -344,7 +344,7 @@ class SynapseMemory:
             self.store.add_feedback(q["hash"], nid, q["features"][nid].tobytes(),
                                     False, label_src, self.cfg.replay_cap)
         pairs += self._replay(8)
-        self._persist_models()
+        self._persist_ranker()  # ranker only — the embedder is untouched here
         return {"applied": 1.0, "pairs": float(pairs),
                 "loss": loss / max(1, pairs), **self.ranker.stats()}
 
@@ -459,15 +459,25 @@ class SynapseMemory:
             out[etype] = cached
         return out
 
-    def _persist_models(self) -> None:
+    def _persist_ranker(self) -> None:
+        """Persist ONLY the ranker — tiny (~1 KB), safe to write every feedback."""
         self.store.put_param("ranker", self.ranker.dumps())
+
+    def _persist_embedder(self) -> None:
+        """Persist the embedding table — 32 MB, so ONLY after distillation
+        actually mutates it (never on the feedback hot path). Writing it every
+        feedback was a 14 s/20-call zlib bottleneck."""
         if self._emb_path:
             try:
                 self.embedder.save(self._emb_path)
+                return
             except OSError:
-                self.store.put_param("embedder", self.embedder.dumps())
-        else:
-            self.store.put_param("embedder", self.embedder.dumps())
+                pass
+        self.store.put_param("embedder", self.embedder.dumps())
+
+    def _persist_models(self) -> None:
+        self._persist_ranker()
+        self._persist_embedder()
 
     def _save_text_for_distill(self, node_id: str, body: str) -> None:
         # Distillation needs the text back; store a bounded copy in params-space.

@@ -258,3 +258,35 @@ async def test_vector_handle_shapes():
     assert doc and doc["title"] == "게임"
     await handle.remove("a")
     assert await handle.fetch_document("a") is None
+
+
+def test_blend_gate_resists_label_noise():
+    """Random feedback must NOT open the blend gate — the McNemar+Wilson
+    gate's core safety property (regression guard for the 0.05 leak)."""
+    mem = make_mem(blend_min_events=40)
+    for t in ("게임", "요리", "개발"):
+        for i in range(6):
+            mem.index(f"{t}-{i}", f"{t} 관련 메모 상세 {i}", title=f"{t} {i}", tags=[t])
+    import random as _r
+    rng = _r.Random(0)
+    for _ in range(300):
+        hits = mem.search("게임 요리 개발 메모", top_k=10)
+        if len(hits) >= 2:
+            mem.feedback(hits[0].query_token, used_ids=[h.id for h in rng.sample(hits, 2)])
+    assert mem.stats()["ranker"]["blend"] == 0.0  # floor protected under noise
+
+
+def test_feedback_does_not_persist_embedder():
+    """feedback() must persist ONLY the ranker — writing the 32MB embedding
+    table every feedback was a 200× slowdown (regression guard)."""
+    import time as _t
+    mem = make_mem()
+    for i in range(6):
+        mem.index(f"n{i}", f"메모 {i} 내용 기록", title=f"노트 {i}", tags=["x"])
+    t0 = _t.perf_counter()
+    for _ in range(40):
+        h = mem.search("메모 기록", top_k=6)
+        if len(h) >= 2:
+            mem.feedback(h[0].query_token, used_ids=[h[0].id])
+    per_loop_ms = (_t.perf_counter() - t0) / 40 * 1000
+    assert per_loop_ms < 50, f"feedback loop {per_loop_ms:.0f}ms — embedder likely re-serialized"

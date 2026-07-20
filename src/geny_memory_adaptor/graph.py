@@ -24,20 +24,32 @@ from .store import EDGE_COACCESS, EDGE_KNN, EDGE_LINK, EDGE_TAG, Store
 _WEEK = 7 * 24 * 3600.0
 
 
+#: A tag on more than this FRACTION of the corpus is a "meta tag" (status,
+#: type markers like execution/success/note) — it carries no topical signal
+#: and, worse, densifies the tag graph toward a clique that makes PPR blow up.
+#: Such tags are excluded from edge derivation.
+_TAG_DF_CUTOFF = 0.30
+#: Absolute floor so tiny corpora don't drop everything.
+_TAG_DF_MIN_DOCS = 40
+
+
 def derive_tag_edges(tag_members: Dict[str, List[str]], n_docs: int, node_id: str,
                      tags: Sequence[str], *, fanout: int = 6) -> List[Tuple[str, float]]:
     """IDF-weighted shared-tag edges from *node_id* to its tag-mates.
 
     *tag_members* is the engine's cached {tag: [node_ids]} map — passing it in
-    keeps bulk indexing O(N) instead of O(N²)."""
+    keeps bulk indexing O(N) instead of O(N²). Meta tags (present on a large
+    fraction of the corpus) are skipped: no topical signal, and they would
+    otherwise turn the tag graph into a near-clique."""
     if not tags:
         return []
     n = max(1, n_docs)
+    cutoff = max(_TAG_DF_MIN_DOCS, int(n * _TAG_DF_CUTOFF))
     weights: Dict[str, float] = {}
     for tag in tags:
         members = tag_members.get(tag, [])
         df = len(members)
-        if df < 2:
+        if df < 2 or df > cutoff:
             continue
         idf = math.log(1.0 + n / df)
         # Fanout cap: hub tags connect only a bounded number of mates.
@@ -139,8 +151,15 @@ def personalized_pagerank(
         # Restart + dangling mass in one pass over the (small) seed dict.
         for k, v in restart.items():
             nxt[k] += alpha * v + dangling * v
-        delta = sum(abs(nxt.get(k, 0.0) - rank.get(k, 0.0))
-                    for k in nxt.keys() | rank.keys())
+        # L1 convergence — a rank key absent from nxt contributes its own
+        # value; nxt keys are a superset of the mass that moved, so summing
+        # over nxt (plus rank-only keys) is exact without a full set union.
+        delta = 0.0
+        for k, nv in nxt.items():
+            delta += abs(nv - rank.get(k, 0.0))
+        for k, rv in rank.items():
+            if k not in nxt:
+                delta += rv
         rank = dict(nxt)
         if delta < tol:
             break

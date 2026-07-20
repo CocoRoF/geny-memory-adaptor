@@ -172,3 +172,19 @@ def test_partial_compound_query():
     mem = seeded()
     # Head-noun-only query still finds the compound-titled doc via bigrams.
     assert mem.search("실록")[0].id == "sillok"
+
+
+def test_agent_memory_hard_queries():
+    """Hand-authored agent-memory set: indirect reference, paraphrase, ko/en
+    mix, 활용 변형. Guards realistic agent retrieval (R@1 ≥ 0.85 floor)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eval"))
+    from agent_memory_ko import NOTES, QUERIES
+
+    mem = make_mem()
+    for nid, title, body, kind, tags in NOTES:
+        mem.index(nid, body, title=title, kind=kind, tags=tags)
+    at1 = sum(1 for q, gold, _ in QUERIES
+              if (r := mem.search(q, top_k=5)) and r[0].id == gold)
+    assert at1 / len(QUERIES) >= 0.85, f"R@1 {at1}/{len(QUERIES)}"
