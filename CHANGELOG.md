@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.2.2] — 2026-07-20
+
+High-difficulty stress hardening. Three more executed adversarial passes —
+50k-note scale, SIGKILL/torn-write crash recovery, and input fuzzing — each
+found real issues; all fixed with regression tests. MIRACL-ko unchanged (nDCG
+0.593).
+
+### Fixed — scale (O(N²) → linear)
+- **Bulk indexing was O(N²)** — each `index()` re-`np.stack`ed EVERY vector for
+  k-NN (12→33 ms/note climbing at 10k→40k). k-NN now compares against the most
+  recent `knn_sample_cap` (4096) vectors and uses `argpartition`; indexing is
+  flat (~5 ms/note through 40k, 232 MB steady).
+- **Re-indexing was O(N²)** — a re-index dropped the whole tag cache, forcing an
+  O(N) rebuild (541 ms/re-index at 40k). Now incremental: remove the node from
+  its old tags, add the new ones — O(#tags), 1.5 ms/re-index.
+
+### Fixed — crash safety
+- **`index()` wasn't atomic** — it issued ~6 separate transactions, so a
+  mid-index failure (disk-full/crash) could leave an orphan node with no
+  vector/postings. All sub-writes (node + postings + vector + edges + teacher +
+  text) now commit in ONE transaction via `Store.index_atomic`; a failure rolls
+  the whole memory back. (Crash review already verified WAL recovery, torn
+  distill-swap rollback, 8-process concurrency, and truncation all clean.)
+
+### Fixed — adversarial input (DoS + validation)
+- **Space-free megabyte token DoS** — one giant token (base64 blob, long URL,
+  CJK run) blew up the tokenizer O(len) (OOM at ~10 MB) because the output cap
+  was checked after n-gramming and jamo tripled it. Each word is truncated to
+  128 chars and the scan is capped at 500k chars — a 2 MB token now indexes in
+  13 ms (was killed).
+- **No config validation** → cryptic numpy crashes / silent NaN weights.
+  `SynapseConfig` now rejects `dim<1`, `vocab_size<2`, `hidden<1`, non-finite
+  or non-positive `lr`, negative/non-finite `l2`, `top_k<1`, `epsilon∉[0,1]`.
+- **`top_k` contract** — `top_k=0` was silently treated as the default and
+  negatives sliced from the tail. Now `top_k=0` → empty, negatives clamp to 0.
+
+### Verified robust (adversarial, reproduced)
+- Malicious node ids (SQL metachars, null bytes, 10k-char, emoji) — parametrized
+  queries, no injection, no collision. Pathological text (1 MB blobs, RTL/CJK
+  mix, 100k distinct tokens), 10k tags, link cycles, jamo edge cases, feedback
+  and search abuse — all bounded and finite. Long run (30k feedbacks) — no NaN,
+  no divergence, steady memory.
+
 ## [1.2.1] — 2026-07-20
 
 Final gatekeeper review (three more adversarial passes: fix-correctness,

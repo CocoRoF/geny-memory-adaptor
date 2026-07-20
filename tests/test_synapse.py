@@ -511,3 +511,68 @@ def test_search_is_idempotent_within_a_call():
     # Re-score the SAME captured features with the pre-search ranker state would
     # match; here we just assert a stable, sane top result and no NaN/inf.
     assert r and all(np.isfinite(h.score) for h in r)
+
+
+def test_giant_wordless_token_is_bounded():
+    """Fuzz F1 (HIGH DoS): a megabyte-long space-free token must index/search
+    in bounded time — the n-gram + jamo expansion used to OOM."""
+    import time
+    mem = make_mem()
+    t0 = time.perf_counter()
+    mem.index("blob", "x" * 2_000_000)  # base64/URL/CJK-run shaped
+    mem.search("가" * 1_000_000, top_k=5)
+    assert time.perf_counter() - t0 < 2.0  # was >30s / killed
+
+
+def test_config_validation_rejects_bad_values():
+    """Fuzz F2/F3/F5: clear ValueError instead of a cryptic numpy crash or a
+    silent NaN-weight poisoning downstream."""
+    for kw in [{"dim": 0}, {"dim": -1}, {"vocab_size": 1}, {"hidden": 0},
+               {"lr": float("inf")}, {"lr": 0.0}, {"l2": float("nan")},
+               {"top_k": 0}, {"epsilon": 2.0}]:
+        with pytest.raises(ValueError):
+            SynapseConfig(path=":memory:", **kw)
+
+
+def test_top_k_edges():
+    """Fuzz F4: top_k=0 → empty, negative → empty, None → default."""
+    mem = make_mem()
+    for i in range(10):
+        mem.index(f"n{i}", f"게임 판정 {i}", tags=["게임"])
+    assert mem.search("게임", top_k=0) == []
+    assert mem.search("게임", top_k=-5) == []
+    assert len(mem.search("게임")) == 8
+
+
+def test_index_is_atomic_on_failure():
+    """Crash-review should-fix: a mid-index store failure must roll the whole
+    node back — no orphan node row without vector/postings."""
+    mem = make_mem()
+    for i in range(5):
+        mem.index(f"n{i}", f"게임 판정 {i}", tags=["게임"])
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full mid-index")
+    mem.store.index_atomic = boom  # type: ignore
+    with pytest.raises(RuntimeError):
+        mem.index("orphan", "실패", tags=["x"], teacher_vec=[0.1] * 8)
+    assert mem.store.get_node("orphan") is None
+    assert "orphan" not in {nid for nid, _, _ in mem.store.all_vectors()}
+    assert mem.store.count_nodes() == 5  # existing nodes intact
+
+
+def test_knn_sample_cap_keeps_indexing_bounded():
+    """Scale-review: with more than sample_cap vectors, a new node's k-NN is
+    computed only against the recent slice — per-index cost stays flat."""
+    import time
+    mem = make_mem(knn_sample_cap=200)
+    for i in range(200):
+        mem.index(f"seed{i}", f"게임 판정 메모 {i}", tags=["게임"])
+    t0 = time.perf_counter()
+    for i in range(200):
+        mem.index(f"more{i}", f"게임 판정 추가 {i}", tags=["게임"])
+    per = (time.perf_counter() - t0) / 200 * 1000
+    assert per < 20  # flat, not growing with corpus size
+    # still produces knn edges (from the capped sample)
+    from geny_memory_adaptor.store import EDGE_KNN
+    assert len(mem.store.edges_by_type(EDGE_KNN)) > 0

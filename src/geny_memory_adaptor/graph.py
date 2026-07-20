@@ -60,16 +60,29 @@ def derive_tag_edges(tag_members: Dict[str, List[str]], n_docs: int, node_id: st
 
 
 def derive_knn_edges(query_vec, vectors: Dict[str, "object"], node_id: str,
-                     *, k: int = 6, min_sim: float = 0.25) -> List[Tuple[str, float]]:
-    """Semantic neighbours of a freshly indexed node (local embedding space)."""
+                     *, k: int = 6, min_sim: float = 0.25,
+                     sample_cap: int = 4096) -> List[Tuple[str, float]]:
+    """Semantic neighbours of a freshly indexed node (local embedding space).
+
+    Scanning EVERY vector per index makes bulk indexing O(N²). KNN edges are a
+    graph-expansion aid, not exact — so above *sample_cap* we compare only
+    against the most recently indexed vectors (dict keeps insertion order),
+    which keeps indexing linear and biases toward recent, likely-more-relevant
+    memories. `argpartition` finds the top-k in O(N) instead of a full sort."""
     import numpy as np
 
     ids = [i for i in vectors.keys() if i != node_id]
     if not ids:
         return []
+    if len(ids) > sample_cap:
+        ids = ids[-sample_cap:]
     mat = np.stack([vectors[i] for i in ids])
     sims = mat @ query_vec
-    order = np.argsort(-sims)[:k]
+    if len(sims) > k:
+        top = np.argpartition(-sims, k)[:k]
+    else:
+        top = np.arange(len(sims))
+    order = top[np.argsort(-sims[top])]
     return [(ids[int(j)], float(sims[int(j)])) for j in order if sims[int(j)] >= min_sim]
 
 

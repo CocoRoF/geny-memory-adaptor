@@ -107,6 +107,10 @@ class SynapseConfig:
     #: Semantic k-NN edges derived at index time.
     knn_edges: int = 6
     knn_min_sim: float = 0.25
+    #: Above this many vectors, a new node's k-NN is computed only against the
+    #: most recently indexed `knn_sample_cap` — keeps bulk indexing linear
+    #: instead of O(N²). Raise for exact k-NN on large static corpora.
+    knn_sample_cap: int = 4096
     #: Tag-edge fanout cap per tag (anti-hub).
     tag_fanout: int = 6
     #: Hebbian co-access learning rate / weekly decay / prune floor.
@@ -136,6 +140,26 @@ class SynapseConfig:
 
     #: Free-form extras for forward compatibility.
     extras: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Fail fast with a clear message instead of a cryptic numpy traceback
+        (dim<0 → 'negative dimensions', vocab_size=0 → modulo-by-zero) or a
+        silent NaN weight-poisoning (lr=inf) far downstream."""
+        import math as _m
+        if self.dim < 1:
+            raise ValueError(f"dim must be ≥ 1, got {self.dim}")
+        if self.vocab_size < 2:
+            raise ValueError(f"vocab_size must be ≥ 2, got {self.vocab_size}")
+        if self.hidden < 1:
+            raise ValueError(f"hidden must be ≥ 1, got {self.hidden}")
+        if not (_m.isfinite(self.lr) and self.lr > 0):
+            raise ValueError(f"lr must be a positive finite float, got {self.lr}")
+        if not (_m.isfinite(self.l2) and self.l2 >= 0):
+            raise ValueError(f"l2 must be a non-negative finite float, got {self.l2}")
+        if self.top_k < 1:
+            raise ValueError(f"top_k must be ≥ 1, got {self.top_k}")
+        if not (0.0 <= self.epsilon <= 1.0):
+            raise ValueError(f"epsilon must be in [0, 1], got {self.epsilon}")
 
     @classmethod
     def from_env(cls, *, dotenv: Optional[str] = None, **overrides: Any) -> "SynapseConfig":

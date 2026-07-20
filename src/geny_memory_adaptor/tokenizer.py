@@ -48,13 +48,28 @@ def _ngrams(word: str, sizes: Iterable[int]) -> List[str]:
     return out
 
 
+#: A single "word" with no internal spaces (a base64 blob, a long URL, a run
+#: of CJK) is truncated to this before n-gramming. Without it the per-word
+#: n-gram list (and the 3× jamo expansion) grows O(len), so one megabyte-long
+#: token is an OOM/hang DoS even though the OUTPUT token cap looks bounded.
+#: 128 chars keeps every real word intact while defanging pathological ones —
+#: matching on the first 128 chars of a blob is plenty for retrieval.
+_MAX_WORD_LEN = 128
+#: Only the first this-many characters of a document/query are scanned. A note
+#: with real signal in its first ~half-MB is already far beyond any prompt
+#: budget; scanning a multi-megabyte blob in full is pure DoS surface.
+_MAX_TEXT_SCAN = 500_000
+
+
 def _words(text: str) -> List[str]:
+    if len(text) > _MAX_TEXT_SCAN:
+        text = text[:_MAX_TEXT_SCAN]
     out = []
     for match in _WORD.finditer(normalize(text)):
         w = match.group()
         if w in _STOP or (w.isdigit() and len(w) > 6):
             continue
-        out.append(w)
+        out.append(w if len(w) <= _MAX_WORD_LEN else w[:_MAX_WORD_LEN])
     return out
 
 

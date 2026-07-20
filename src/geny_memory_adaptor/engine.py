@@ -138,6 +138,7 @@ class SynapseMemory:
         with self._lock:
             existing = self.store.get_node(node_id)  # None ⇒ fresh insert
             body = f"{title}\n{text}" if title else text
+            # ── compute everything FIRST (reads + numpy), commit ONCE ──
             # LEXICAL stream → BM25 postings (words + stems + syllable bigrams
             # + cross-space bigrams). The jamo-augmented EMBEDDING stream lives
             # only inside the hash embedder.
@@ -145,9 +146,6 @@ class SynapseMemory:
                           suffix_strip=self.cfg.suffix_strip,
                           cross_space=self.cfg.cross_space)
             tokens = lexical_tokens(body, limit=self.cfg.max_doc_tokens, **tok_kw)
-            self.store.upsert_node(
-                node_id, kind=kind, title=title, tags=tags, text_len=len(tokens),
-                updated_at=updated_at or time.time(), pinned=pinned, importance=importance)
             # BM25F-lite: title terms weigh title_boost× (the title already
             # appears once inside `body`, so the extra weight is title_boost−1).
             tf = term_frequencies(tokens)
@@ -155,52 +153,52 @@ class SynapseMemory:
                 extra = self.cfg.title_boost - 1.0
                 for t in set(lexical_tokens(title, limit=64, **tok_kw)):
                     tf[t] = tf.get(t, 0.0) + extra
-            self.store.replace_postings(node_id, tf)
             vec = self.embedder.embed(body, limit=self.cfg.max_doc_tokens)
-            self.store.put_vector(node_id, pack_vec(vec), self.cfg.dim)
+            # Edges. LINK is stored ONE-directional and symmetrized at query
+            # time (build_type_adjacency), so a changed link set can't orphan a
+            # reverse edge. TAG/KNN derived from current graph state.
+            tag_edges = derive_tag_edges(self._tags_map(), self._n_docs(), node_id,
+                                         tags, fanout=self.cfg.tag_fanout)
+            knn_edges = derive_knn_edges(vec, self._vectors(), node_id,
+                                         k=self.cfg.knn_edges, min_sim=self.cfg.knn_min_sim,
+                                         sample_cap=self.cfg.knn_sample_cap)
+            teacher = None
+            if teacher_vec is not None:
+                tv = np.asarray(teacher_vec, dtype=np.float32)
+                teacher = (teacher_model, pack_vec(tv), int(tv.shape[0]))
+            text_param = ((f"text:{node_id}", body[:4000].encode("utf-8"))
+                          if self.cfg.store_text else None)
 
-            # Cache maintenance. On a RE-INDEX the tag set may have changed, so
-            # an incremental "append to new tags" leaves the node listed under
-            # its OLD tags — drop the whole tag cache and let it rebuild. Fresh
-            # inserts stay incremental (fast bulk indexing).
+            # ── one atomic transaction: node + postings + vector + edges ──
+            self.store.index_atomic(
+                node_id, kind=kind, title=title, tags=tags, text_len=len(tokens),
+                updated_at=updated_at or time.time(), pinned=pinned, importance=importance,
+                tf=tf, vec=pack_vec(vec), dim=self.cfg.dim,
+                edges=[(EDGE_LINK, [(dst, 1.0) for dst in links]),
+                       (EDGE_TAG, tag_edges), (EDGE_KNN, knn_edges)],
+                teacher=teacher, text_param=text_param)
+
+            # ── cache maintenance (after the commit succeeds) ──
             if self._vec_cache is not None:
                 self._vec_cache[node_id] = vec
             self._vec_matrix = None
             if self._doclen_cache is not None:
                 self._doclen_cache[node_id] = len(tokens)
-            if existing is not None:
-                self._tag_cache = None
-            elif self._tag_cache is not None:
+            # Tag cache: INCREMENTAL on both insert and re-index. On a re-index
+            # remove the node from its OLD tags (read off `existing`) then add
+            # the new ones — O(#tags), NOT an O(N) full-cache rebuild (which
+            # made re-indexing a big corpus O(N²): 541 ms/re-index at 40k).
+            if self._tag_cache is not None:
+                if existing is not None:
+                    for t in existing["tags"]:
+                        lst = self._tag_cache.get(t)
+                        if lst and node_id in lst:
+                            lst.remove(node_id)
                 for t in tags:
-                    members = self._tag_cache.setdefault(t, [])
-                    if node_id not in members:
-                        members.append(node_id)
-
-            # Edges. LINK is stored ONE-directional (only what this node
-            # declares) and symmetrized at query time in build_type_adjacency —
-            # so re-indexing with a changed link set can't leave a dangling
-            # reverse edge (the old bug: reverse edges had src=<other>, which
-            # replace_edges_from never cleans).
-            self.store.replace_edges_from(
-                node_id, EDGE_LINK, [(dst, 1.0) for dst in links])
-            self.store.replace_edges_from(
-                node_id, EDGE_TAG,
-                derive_tag_edges(self._tags_map(), self._n_docs(), node_id, tags,
-                                 fanout=self.cfg.tag_fanout))
-            vectors = self._vectors()
-            self.store.replace_edges_from(
-                node_id, EDGE_KNN,
-                derive_knn_edges(vec, vectors, node_id,
-                                 k=self.cfg.knn_edges, min_sim=self.cfg.knn_min_sim))
+                    lst = self._tag_cache.setdefault(t, [])
+                    if node_id not in lst:
+                        lst.append(node_id)
             self._adj_cache.clear()
-            # Distillation labels + text are kept ONLY for nodes that carry a
-            # teacher vector — otherwise every note body was duplicated into the
-            # params table forever (a disk/RAM leak, never cleaned on remove).
-            if teacher_vec is not None:
-                t = np.asarray(teacher_vec, dtype=np.float32)
-                self.store.put_teacher(node_id, teacher_model, pack_vec(t), int(t.shape[0]))
-            if self.cfg.store_text:
-                self._save_text_for_distill(node_id, body)
 
     def remove(self, node_id: str) -> None:
         with self._lock:
@@ -228,7 +226,9 @@ class SynapseMemory:
 
     def _search(self, query: str, *, top_k: Optional[int] = None,
                 kinds: Optional[Sequence[str]] = None) -> List[SearchHit]:
-        top_k = top_k or self.cfg.top_k
+        # `is None` (not truthiness) so an explicit top_k=0 means "0 results",
+        # and clamp negatives to 0 rather than slicing from the tail.
+        top_k = self.cfg.top_k if top_k is None else max(0, top_k)
         q_tokens = lexical_tokens(query, char_ngrams=self.cfg.char_ngrams,
                                   suffix_strip=self.cfg.suffix_strip,
                                   cross_space=self.cfg.cross_space,

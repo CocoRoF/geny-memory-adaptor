@@ -94,6 +94,49 @@ class Store:
             (node_id, kind, title, json.dumps(list(tags), ensure_ascii=False),
              text_len, updated_at, int(pinned), importance)))
 
+    def index_atomic(
+        self, node_id: str, *, kind: str, title: str, tags: Sequence[str],
+        text_len: int, updated_at: float, pinned: bool, importance: float,
+        tf: Dict[str, float], vec: bytes, dim: int,
+        edges: Sequence[Tuple[int, Sequence[Tuple[str, float]]]],
+        teacher: Optional[Tuple[str, bytes, int]] = None,
+        text_param: Optional[Tuple[str, bytes]] = None,
+    ) -> None:
+        """Write one memory's node + postings + vector + edges (+ optional
+        teacher / distill-text) in a SINGLE transaction, so a mid-index failure
+        (disk-full, crash) rolls the whole node back instead of leaving an
+        orphan node row with no vector or postings."""
+        ts = time.time()
+
+        def _do(c):
+            c.execute(
+                "INSERT INTO nodes(id,kind,title,tags,text_len,updated_at,pinned,importance)"
+                " VALUES(?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,title=excluded.title,"
+                " tags=excluded.tags,text_len=excluded.text_len,updated_at=excluded.updated_at,"
+                " pinned=excluded.pinned,importance=excluded.importance",
+                (node_id, kind, title, json.dumps(list(tags), ensure_ascii=False),
+                 text_len, updated_at, int(pinned), importance))
+            c.execute("DELETE FROM postings WHERE node_id=?", (node_id,))
+            c.executemany(
+                "INSERT OR REPLACE INTO postings(term,node_id,tf) VALUES(?,?,?)",
+                [(t, node_id, f) for t, f in tf.items()])
+            c.execute("INSERT OR REPLACE INTO vectors(node_id,dim,vec) VALUES(?,?,?)",
+                      (node_id, dim, vec))
+            for etype, rows in edges:
+                c.execute("DELETE FROM edges WHERE src=? AND etype=?", (node_id, etype))
+                c.executemany(
+                    "INSERT OR REPLACE INTO edges(src,dst,etype,w,updated) VALUES(?,?,?,?,?)",
+                    [(node_id, d, etype, w, ts) for d, w in rows])
+            if teacher is not None:
+                model, tvec, tdim = teacher
+                c.execute("INSERT OR REPLACE INTO teacher_vecs(node_id,model,dim,vec)"
+                          " VALUES(?,?,?,?)", (node_id, model, tdim, tvec))
+            if text_param is not None:
+                key, blob = text_param
+                c.execute("INSERT OR REPLACE INTO params(key,blob) VALUES(?,?)", (key, blob))
+        self._write(_do)
+
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         rows = self._read(
             "SELECT id,kind,title,tags,text_len,updated_at,access_count,last_access,"
