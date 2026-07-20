@@ -52,10 +52,15 @@ class SynapseConfig:
     """All engine knobs. See module docstring for the precedence rules."""
 
     # ── storage ──
-    #: SQLite database path. ``":memory:"`` for ephemeral (tests).
+    #: SQLite database path. ``":memory:"`` for ephemeral (tests). The learned
+    #: embedding table lives INSIDE this db (a params row), so a distill can
+    #: swap the table and re-embed every vector in ONE atomic transaction — no
+    #: sidecar file to fall out of sync, and two instances can't clobber it.
     path: str = "synapse.db"
-    #: Embedding table sidecar (npz). Default: ``<path>.emb.npz`` next to the db.
-    emb_path: str = ""
+    #: Keep a copy of each note's text (bounded) so ``distill()`` can re-embed
+    #: the whole corpus with an improved table. Cleaned up on ``remove()``.
+    #: Set False when you never distill — then zero note text is duplicated.
+    store_text: bool = True
 
     # ── embedding layer ──
     #: Hash-bucket vocabulary size (power of two).

@@ -142,8 +142,11 @@ def strip_suffix(word: str) -> str:
     if not is_hangul_syllable(prev):
         return word
     tail = has_jongseong(prev)
+    # 로 attaches after a vowel OR an ㄹ-final stem (서울로, 물로) — special case.
+    rieul_ok = last == "로" and (ord(prev) - _BASE) % 28 == 8  # 8 = ㄹ jongseong
     if (last in _JOSA_ANY
             or (last in _JOSA_AFTER_CONSONANT and tail)
-            or (last in _JOSA_AFTER_VOWEL and not tail)):
+            or (last in _JOSA_AFTER_VOWEL and not tail)
+            or rieul_ok):
         return word[:-1]
     return word

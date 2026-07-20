@@ -4,6 +4,12 @@ Everything here is DERIVED data (the caller's source of truth is wherever the
 memories actually live — markdown files, a DB, an app). Dropping the file and
 re-indexing is always safe, which is what makes the engine adoptable next to
 an existing store without migration risk.
+
+Concurrency: ONE ``sqlite3.Connection`` is shared across threads
+(``check_same_thread=False``), so EVERY method — reads included — takes the
+re-entrant lock before touching it. Multi-statement writes commit inside a
+``try/except`` that rolls back on failure, so a mid-write exception can never
+leave a partial transaction to be committed by the next writer.
 """
 
 from __future__ import annotations
@@ -45,7 +51,7 @@ EDGE_LINK, EDGE_TAG, EDGE_KNN, EDGE_COACCESS = 0, 1, 2, 3
 
 
 class Store:
-    """Thread-safe (single lock) wrapper over the SQLite state."""
+    """Thread-safe (single re-entrant lock) wrapper over the SQLite state."""
 
     def __init__(self, path: str = ":memory:") -> None:
         self._conn = sqlite3.connect(path, check_same_thread=False)
@@ -57,44 +63,57 @@ class Store:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
 
+    # ── transactional write helper ───────────────────────────────────
+    def _write(self, fn) -> Any:
+        """Run *fn(conn)* under the lock, commit, and roll back on any error
+        so a partial multi-statement write is never left for the next commit."""
+        with self._lock:
+            try:
+                result = fn(self._conn)
+                self._conn.commit()
+                return result
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _read(self, sql: str, params: Sequence[Any] = ()) -> List[Tuple]:
+        with self._lock:
+            return list(self._conn.execute(sql, params).fetchall())
+
     # ── nodes ────────────────────────────────────────────────────────
     def upsert_node(
         self, node_id: str, *, kind: str, title: str, tags: Sequence[str],
         text_len: int, updated_at: float, pinned: bool, importance: float,
     ) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO nodes(id,kind,title,tags,text_len,updated_at,pinned,importance)"
-                " VALUES(?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,title=excluded.title,"
-                " tags=excluded.tags,text_len=excluded.text_len,updated_at=excluded.updated_at,"
-                " pinned=excluded.pinned,importance=excluded.importance",
-                (node_id, kind, title, json.dumps(list(tags), ensure_ascii=False),
-                 text_len, updated_at, int(pinned), importance),
-            )
-            self._conn.commit()
+        self._write(lambda c: c.execute(
+            "INSERT INTO nodes(id,kind,title,tags,text_len,updated_at,pinned,importance)"
+            " VALUES(?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,title=excluded.title,"
+            " tags=excluded.tags,text_len=excluded.text_len,updated_at=excluded.updated_at,"
+            " pinned=excluded.pinned,importance=excluded.importance",
+            (node_id, kind, title, json.dumps(list(tags), ensure_ascii=False),
+             text_len, updated_at, int(pinned), importance)))
 
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
-        cur = self._conn.execute(
+        rows = self._read(
             "SELECT id,kind,title,tags,text_len,updated_at,access_count,last_access,"
             "pinned,importance FROM nodes WHERE id=?", (node_id,))
-        row = cur.fetchone()
-        return self._node_row(row) if row else None
+        return self._node_row(rows[0]) if rows else None
 
     def nodes(self, ids: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
         if ids is None:
-            cur = self._conn.execute(
+            rows = self._read(
                 "SELECT id,kind,title,tags,text_len,updated_at,access_count,last_access,"
                 "pinned,importance FROM nodes")
-            return [self._node_row(r) for r in cur.fetchall()]
+            return [self._node_row(r) for r in rows]
         ids = list(ids)
         if not ids:
             return []
         q = ",".join("?" for _ in ids)
-        cur = self._conn.execute(
+        rows = self._read(
             f"SELECT id,kind,title,tags,text_len,updated_at,access_count,last_access,"
             f"pinned,importance FROM nodes WHERE id IN ({q})", ids)
-        return [self._node_row(r) for r in cur.fetchall()]
+        return [self._node_row(r) for r in rows]
 
     @staticmethod
     def _node_row(r: Tuple) -> Dict[str, Any]:
@@ -105,145 +124,145 @@ class Store:
         }
 
     def remove_node(self, node_id: str) -> None:
-        with self._lock:
+        def _do(c):
             for sql in (
                 "DELETE FROM nodes WHERE id=?", "DELETE FROM postings WHERE node_id=?",
                 "DELETE FROM vectors WHERE node_id=?", "DELETE FROM teacher_vecs WHERE node_id=?",
-                "DELETE FROM edges WHERE src=? ", "DELETE FROM feedback WHERE node_id=?",
+                "DELETE FROM edges WHERE src=?", "DELETE FROM feedback WHERE node_id=?",
+                "DELETE FROM edges WHERE dst=?",
             ):
-                self._conn.execute(sql, (node_id,))
-            self._conn.execute("DELETE FROM edges WHERE dst=?", (node_id,))
-            self._conn.commit()
+                c.execute(sql, (node_id,))
+        self._write(_do)
 
     def touch_access(self, ids: Iterable[str], ts: Optional[float] = None) -> None:
         ts = ts or time.time()
-        with self._lock:
-            self._conn.executemany(
-                "UPDATE nodes SET access_count=access_count+1,last_access=? WHERE id=?",
-                [(ts, i) for i in ids])
-            self._conn.commit()
+        rows = [(ts, i) for i in ids]
+        self._write(lambda c: c.executemany(
+            "UPDATE nodes SET access_count=access_count+1,last_access=? WHERE id=?", rows))
 
     def count_nodes(self) -> int:
-        return int(self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0])
+        return int(self._read("SELECT COUNT(*) FROM nodes")[0][0])
 
     # ── postings (BM25) ──────────────────────────────────────────────
     def replace_postings(self, node_id: str, tf: Dict[str, float]) -> None:
-        with self._lock:
-            self._conn.execute("DELETE FROM postings WHERE node_id=?", (node_id,))
-            self._conn.executemany(
+        def _do(c):
+            c.execute("DELETE FROM postings WHERE node_id=?", (node_id,))
+            c.executemany(
                 "INSERT OR REPLACE INTO postings(term,node_id,tf) VALUES(?,?,?)",
                 [(t, node_id, f) for t, f in tf.items()])
-            self._conn.commit()
+        self._write(_do)
 
     def postings_for_terms(self, terms: Sequence[str]) -> Dict[str, List[Tuple[str, float]]]:
         if not terms:
             return {}
         q = ",".join("?" for _ in terms)
-        cur = self._conn.execute(
-            f"SELECT term,node_id,tf FROM postings WHERE term IN ({q})", list(terms))
         out: Dict[str, List[Tuple[str, float]]] = {}
-        for term, node_id, tf in cur.fetchall():
+        for term, node_id, tf in self._read(
+                f"SELECT term,node_id,tf FROM postings WHERE term IN ({q})", list(terms)):
             out.setdefault(term, []).append((node_id, tf))
         return out
 
     def doc_lens(self) -> Dict[str, int]:
-        cur = self._conn.execute("SELECT id,text_len FROM nodes")
-        return {r[0]: r[1] for r in cur.fetchall()}
+        return {r[0]: r[1] for r in self._read("SELECT id,text_len FROM nodes")}
 
     # ── vectors ──────────────────────────────────────────────────────
     def put_vector(self, node_id: str, vec: bytes, dim: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO vectors(node_id,dim,vec) VALUES(?,?,?)",
-                (node_id, dim, vec))
-            self._conn.commit()
+        self._write(lambda c: c.execute(
+            "INSERT OR REPLACE INTO vectors(node_id,dim,vec) VALUES(?,?,?)",
+            (node_id, dim, vec)))
 
     def all_vectors(self) -> List[Tuple[str, int, bytes]]:
-        return list(self._conn.execute("SELECT node_id,dim,vec FROM vectors").fetchall())
+        return self._read("SELECT node_id,dim,vec FROM vectors")
+
+    def swap_embedder_and_vectors(
+        self, embedder_blob: bytes, vec_rows: Sequence[Tuple[str, int, bytes]]
+    ) -> None:
+        """ATOMIC distill swap: replace the embedder param AND re-embed every
+        vector in ONE transaction. A crash rolls the whole thing back, so the
+        stored table and the vectors it produced are never left inconsistent."""
+        def _do(c):
+            c.execute("INSERT OR REPLACE INTO params(key,blob) VALUES('embedder',?)",
+                      (embedder_blob,))
+            c.executemany(
+                "INSERT OR REPLACE INTO vectors(node_id,dim,vec) VALUES(?,?,?)", vec_rows)
+        self._write(_do)
 
     def put_teacher(self, node_id: str, model: str, vec: bytes, dim: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO teacher_vecs(node_id,model,dim,vec) VALUES(?,?,?,?)",
-                (node_id, model, dim, vec))
-            self._conn.commit()
+        self._write(lambda c: c.execute(
+            "INSERT OR REPLACE INTO teacher_vecs(node_id,model,dim,vec) VALUES(?,?,?,?)",
+            (node_id, model, dim, vec)))
 
     def teachers(self) -> List[Tuple[str, str, int, bytes]]:
-        return list(self._conn.execute(
-            "SELECT node_id,model,dim,vec FROM teacher_vecs").fetchall())
+        return self._read("SELECT node_id,model,dim,vec FROM teacher_vecs")
 
     # ── edges ────────────────────────────────────────────────────────
     def upsert_edges(self, rows: Iterable[Tuple[str, str, int, float]]) -> None:
         ts = time.time()
-        with self._lock:
-            self._conn.executemany(
-                "INSERT INTO edges(src,dst,etype,w,updated) VALUES(?,?,?,?,?)"
-                " ON CONFLICT(src,dst,etype) DO UPDATE SET w=excluded.w,updated=excluded.updated",
-                [(s, d, t, w, ts) for s, d, t, w in rows])
-            self._conn.commit()
+        data = [(s, d, t, w, ts) for s, d, t, w in rows]
+        self._write(lambda c: c.executemany(
+            "INSERT INTO edges(src,dst,etype,w,updated) VALUES(?,?,?,?,?)"
+            " ON CONFLICT(src,dst,etype) DO UPDATE SET w=excluded.w,updated=excluded.updated",
+            data))
 
     def replace_edges_from(self, node_id: str, etype: int,
                            rows: Iterable[Tuple[str, float]]) -> None:
         ts = time.time()
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM edges WHERE src=? AND etype=?", (node_id, etype))
-            self._conn.executemany(
+        data = [(node_id, d, etype, w, ts) for d, w in rows]
+
+        def _do(c):
+            c.execute("DELETE FROM edges WHERE src=? AND etype=?", (node_id, etype))
+            c.executemany(
                 "INSERT OR REPLACE INTO edges(src,dst,etype,w,updated) VALUES(?,?,?,?,?)",
-                [(node_id, d, etype, w, ts) for d, w in rows])
-            self._conn.commit()
+                data)
+        self._write(_do)
 
     def edges_by_type(self, etype: int) -> List[Tuple[str, str, float, float]]:
-        return list(self._conn.execute(
-            "SELECT src,dst,w,updated FROM edges WHERE etype=?", (etype,)).fetchall())
+        return self._read("SELECT src,dst,w,updated FROM edges WHERE etype=?", (etype,))
 
     def get_edge(self, src: str, dst: str, etype: int) -> Optional[Tuple[float, float]]:
-        row = self._conn.execute(
-            "SELECT w,updated FROM edges WHERE src=? AND dst=? AND etype=?",
-            (src, dst, etype)).fetchone()
-        return (row[0], row[1]) if row else None
+        rows = self._read(
+            "SELECT w,updated FROM edges WHERE src=? AND dst=? AND etype=?", (src, dst, etype))
+        return (rows[0][0], rows[0][1]) if rows else None
 
     def set_edge(self, src: str, dst: str, etype: int, w: float) -> None:
         self.upsert_edges([(src, dst, etype, w)])
 
     def prune_edges(self, etype: int, floor: float) -> int:
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM edges WHERE etype=? AND w<?", (etype, floor))
-            self._conn.commit()
-            return cur.rowcount
+        def _do(c):
+            return c.execute("DELETE FROM edges WHERE etype=? AND w<?", (etype, floor)).rowcount
+        return self._write(_do)
 
     # ── params / feedback ────────────────────────────────────────────
     def put_param(self, key: str, blob: bytes) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO params(key,blob) VALUES(?,?)", (key, blob))
-            self._conn.commit()
+        self._write(lambda c: c.execute(
+            "INSERT OR REPLACE INTO params(key,blob) VALUES(?,?)", (key, blob)))
 
     def get_param(self, key: str) -> Optional[bytes]:
-        row = self._conn.execute("SELECT blob FROM params WHERE key=?", (key,)).fetchone()
-        return row[0] if row else None
+        rows = self._read("SELECT blob FROM params WHERE key=?", (key,))
+        return rows[0][0] if rows else None
+
+    def delete_param(self, key: str) -> None:
+        self._write(lambda c: c.execute("DELETE FROM params WHERE key=?", (key,)))
 
     def add_feedback(self, query_hash: str, node_id: str, features: bytes,
                      used: bool, label_src: str, cap: int) -> None:
-        with self._lock:
-            self._conn.execute(
+        def _do(c):
+            c.execute(
                 "INSERT INTO feedback(ts,query_hash,node_id,features,shown,used,label_src)"
                 " VALUES(?,?,?,?,1,?,?)",
                 (time.time(), query_hash, node_id, features, int(used), label_src))
-            # FIFO cap.
-            self._conn.execute(
+            c.execute(
                 "DELETE FROM feedback WHERE rowid <= "
                 "(SELECT MAX(rowid) FROM feedback) - ?", (cap,))
-            self._conn.commit()
+        self._write(_do)
 
     def feedback_rows(self, limit: int) -> List[Tuple[str, bytes, int]]:
-        return list(self._conn.execute(
+        return self._read(
             "SELECT query_hash,features,used FROM feedback ORDER BY rowid DESC LIMIT ?",
-            (limit,)).fetchall())
+            (limit,))
 
     def feedback_count(self) -> int:
-        return int(self._conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0])
+        return int(self._read("SELECT COUNT(*) FROM feedback")[0][0])
 
     def close(self) -> None:
         with self._lock:

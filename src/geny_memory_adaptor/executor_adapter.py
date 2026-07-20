@@ -17,6 +17,8 @@ CPU-bound milliseconds, so there is nothing to await.
 
 from __future__ import annotations
 
+import asyncio
+
 from typing import Any, Dict, List, Optional, Sequence
 
 from .engine import SearchHit, SynapseMemory
@@ -40,9 +42,7 @@ class SynapseVectorHandle:
             "api_calls": 0,
         }
 
-    async def index(self, doc_id: str, text: str,
-                    metadata: Optional[Dict[str, Any]] = None) -> None:
-        md = metadata or {}
+    def _index_sync(self, doc_id: str, text: str, md: Dict[str, Any]) -> None:
         self._m.index(
             doc_id, text,
             title=str(md.get("title") or ""),
@@ -55,14 +55,21 @@ class SynapseVectorHandle:
             teacher_model=str(md.get("teacher_model") or ""),
         )
 
+    async def index(self, doc_id: str, text: str,
+                    metadata: Optional[Dict[str, Any]] = None) -> None:
+        # Synapse ops are sync CPU; offload so the event loop keeps serving.
+        await asyncio.to_thread(self._index_sync, doc_id, text, metadata or {})
+
     async def index_batch(self, docs: Sequence[Dict[str, Any]]) -> int:
-        for d in docs:
-            await self.index(d["id"], d.get("text") or "", d.get("metadata"))
-        return len(docs)
+        def _do() -> int:
+            for d in docs:
+                self._index_sync(d["id"], d.get("text") or "", d.get("metadata") or {})
+            return len(docs)
+        return await asyncio.to_thread(_do)
 
     async def search(self, query: str, *, top_k: int = 8,
                      score_threshold: float = 0.0) -> List[Dict[str, Any]]:
-        hits = self._m.search(query, top_k=top_k)
+        hits = await asyncio.to_thread(self._m.search, query, top_k=top_k)
         return [
             {
                 "id": h.id, "score": h.score, "title": h.title, "kind": h.kind,
@@ -72,12 +79,12 @@ class SynapseVectorHandle:
         ]
 
     async def remove(self, doc_id: str) -> None:
-        self._m.remove(doc_id)
+        await asyncio.to_thread(self._m.remove, doc_id)
 
     async def reindex(self) -> int:
-        # Synapse indexes are derived + incremental; distill() is the only
-        # batch maintenance and doubles as "reindex with a better model".
-        metrics = self._m.distill()
+        # distill() re-embeds the whole corpus (seconds) — must not block the
+        # event loop.
+        metrics = await asyncio.to_thread(self._m.distill)
         return int(metrics.get("pairs", 0))
 
     async def fetch_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
@@ -95,7 +102,7 @@ class SynapseRetriever:
 
     async def retrieve(self, query: str, *, top_k: int = 8,
                        kinds: Optional[Sequence[str]] = None) -> List[SearchHit]:
-        return self._m.search(query, top_k=top_k, kinds=kinds)
+        return await asyncio.to_thread(self._m.search, query, top_k=top_k, kinds=kinds)
 
     async def feedback(self, query_token: str, used_ids: Sequence[str],
                        *, label_src: str = "implicit") -> Dict[str, float]:

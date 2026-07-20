@@ -217,15 +217,44 @@ def test_remove_node_disappears():
 
 
 def test_distill_e2e_reembeds():
-    mem = make_mem()
+    mem = make_mem()  # store_text defaults True
     rng = np.random.default_rng(5)
-    for i in range(20):
+    for i in range(40):  # ≥ MIN_DISTILL_PAIRS
         cluster = i % 2
         text = ("리듬 게임 판정 비트 " if cluster == 0 else "김치 요리 레시피 재료 ") + f"메모 {i}"
         teacher = np.zeros(24); teacher[cluster * 12] = 1.0
         mem.index(f"n{i}", text, teacher_vec=teacher + rng.normal(0, 0.05, 24))
     m = mem.distill()
-    assert m["trained"] == 1.0 and m["pairs"] == 20.0
+    assert m["trained"] == 1.0 and m["pairs"] == 40.0
+    assert "candidate" not in m  # engine consumes it; never leaks the array
+
+
+def test_distill_needs_store_text():
+    mem = make_mem(store_text=False)
+    for i in range(40):
+        t = np.zeros(8); t[(i % 2) * 4] = 1.0
+        mem.index(f"n{i}", f"메모 {i} 내용", teacher_vec=t)
+    assert mem.distill().get("reason_no_text") == 1.0  # no re-embeddable corpus
+
+
+def test_distill_crash_safety_atomic(tmp_path):
+    # Table + vectors swap in one transaction: after a successful distill, a
+    # reopened engine reads a consistent (embedder, vectors) pair.
+    db = str(tmp_path / "d.db")
+    mem = SynapseMemory(SynapseConfig(path=db, vocab_size=4096, dim=32, epsilon=0.0))
+    rng = np.random.default_rng(1)
+    for i in range(40):
+        c = i % 2
+        t = np.zeros(16); t[c * 8] = 1.0
+        mem.index(f"n{i}", ("게임 판정 " if c == 0 else "요리 재료 ") + f"{i}",
+                  teacher_vec=t + rng.normal(0, 0.05, 16))
+    mem.distill()
+    mem.close()
+    mem2 = SynapseMemory(SynapseConfig(path=db, vocab_size=4096, dim=32, epsilon=0.0))
+    # Query vectors (fresh embed) and stored doc vectors use the SAME table.
+    hits = mem2.search("게임 판정")
+    assert hits  # consistent embedder/vectors → search works after reopen
+    mem2.close()
 
 
 # ── config / env ─────────────────────────────────────────────────────
@@ -290,3 +319,107 @@ def test_feedback_does_not_persist_embedder():
             mem.feedback(h[0].query_token, used_ids=[h[0].id])
     per_loop_ms = (_t.perf_counter() - t0) / 40 * 1000
     assert per_loop_ms < 50, f"feedback loop {per_loop_ms:.0f}ms — embedder likely re-serialized"
+
+
+# ── review-fix regressions (adversarial pass) ────────────────────────
+
+def test_reindex_changed_links_no_dangling_edge():
+    """A1: dropping a node's link must not leave a reverse edge behind."""
+    from geny_memory_adaptor.store import EDGE_LINK
+    mem = make_mem()
+    mem.index("n2", "메모 둘 내용")
+    mem.index("n1", "메모 하나 내용", links=["n2"])
+    mem.index("n1", "메모 하나 수정", links=[])  # drop the link
+    link_edges = mem.store.edges_by_type(EDGE_LINK)
+    assert not any(s == "n1" or d == "n1" for s, d, _w, _u in link_edges)
+
+
+def test_reindex_changed_tags_no_stale_membership():
+    """A2: retagging must not leave the node under its old tag."""
+    mem = make_mem()
+    mem.index("a", "가 내용", tags=["A"])
+    mem.index("b", "나 내용", tags=["A"])
+    _ = mem.search("내용")  # warms the tag cache
+    mem.index("a", "가 수정", tags=["B"])  # retag a: A → B
+    tags_map = mem._tags_map()
+    assert "a" not in tags_map.get("A", [])
+    assert "a" in tags_map.get("B", [])
+
+
+def test_remove_purges_feedback_token():
+    """A3: a search token referencing a removed node must not survive."""
+    mem = make_mem(blend_min_events=5)
+    for i in range(4):
+        mem.index(f"n{i}", f"게임 판정 메모 {i}", tags=["게임"])
+    hits = mem.search("게임 판정")
+    tok = hits[0].query_token
+    mem.remove(hits[0].id)
+    r = mem.feedback(tok, used_ids=[h.id for h in hits[:2]])
+    # token was dropped on remove → feedback is a clean no-op, not a resurrect
+    assert r.get("applied") == 0.0
+
+
+def test_remove_deletes_stored_text():
+    """B5: remove() must delete the node's distill-text param (no leak)."""
+    mem = make_mem()
+    mem.index("n1", "지울 메모 본문", teacher_vec=[0.1] * 8)
+    assert mem.store.get_param("text:n1") is not None
+    mem.remove("n1")
+    assert mem.store.get_param("text:n1") is None
+
+
+def test_store_text_false_stores_nothing():
+    mem = make_mem(store_text=False)
+    mem.index("n1", "메모 본문", teacher_vec=[0.1] * 8)
+    assert mem.store.get_param("text:n1") is None
+
+
+def test_store_rollback_leaves_no_partial_write():
+    """B3: a failing multi-statement write rolls back, and the next write's
+    commit does not persist the partial state."""
+    from geny_memory_adaptor.store import Store
+    s = Store(":memory:")
+    s.upsert_node("a", kind="note", title="", tags=[], text_len=1,
+                  updated_at=0, pinned=False, importance=1.0)
+    try:
+        # executemany with a bad row type raises mid-write.
+        s.replace_postings("a", {"ok": 1.0, "bad": object()})  # type: ignore
+    except Exception:
+        pass
+    # 'a' still has no committed postings from the failed call.
+    assert s.postings_for_terms(["ok"]) == {}
+    # a subsequent good write commits cleanly (no leftover open txn).
+    s.replace_postings("a", {"ok": 1.0})
+    assert "ok" in s.postings_for_terms(["ok"])
+    s.close()
+
+
+def test_concurrent_search_index_feedback_no_crash():
+    """B1: hammer one engine from several threads — the lock must prevent the
+    'dict changed size' / half-updated-weights races the reviewer found."""
+    import threading
+    mem = make_mem(blend_min_events=10)
+    for i in range(30):
+        mem.index(f"n{i}", f"게임 판정 메모 {i} 내용", tags=["게임"])
+    errors = []
+
+    def worker(w):
+        try:
+            for j in range(40):
+                if j % 3 == 0:
+                    mem.index(f"n{w}-{j}", f"추가 메모 {w} {j}", tags=["x"])
+                elif j % 3 == 1:
+                    h = mem.search("게임 판정 메모", top_k=8)
+                    if len(h) >= 2:
+                        mem.feedback(h[0].query_token, used_ids=[h[0].id, h[1].id])
+                else:
+                    mem.search("추가 메모 내용", top_k=5)
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    ts = [threading.Thread(target=worker, args=(w,)) for w in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors, errors[:3]

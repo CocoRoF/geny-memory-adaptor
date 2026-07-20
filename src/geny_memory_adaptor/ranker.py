@@ -64,26 +64,24 @@ class OnlineRanker:
         self.mu = np.zeros(N_FEATURES, dtype=np.float32)
         self.var = np.ones(N_FEATURES, dtype=np.float32)
         self.n_norm = 0
-        # Blend gate bookkeeping — a McNemar paired test of learner-vs-
-        # heuristic on the SAME pairs. We count only DISCORDANT pairs (exactly
-        # one of the two ranked it correctly): `disc_b` = learner right &
-        # heuristic wrong, `disc_c` = the reverse. Concordant pairs (both right
-        # or both wrong) carry no comparative signal and would otherwise let a
-        # learner that merely echoes the heuristic — or overfits noise — look
-        # like it wins. The gate opens only when the Wilson lower bound of
-        # b/(b+c) clears 0.5, i.e. the learner is STATISTICALLY better, not
-        # just numerically ahead. Decayed so the test reflects recent skill.
+        # Blend gate — a McNemar paired test of learner-vs-heuristic evaluated
+        # STRICTLY OUT-OF-SAMPLE. Every ~1-in-EVAL_EVERY pair is held out as
+        # eval-only: the learner is NEVER trained on it, only judged. This is
+        # the real defense against label-noise memorization — the learner
+        # cannot memorize a held-out pair's accidental label, so under random
+        # feedback its held-out discordant win-rate is a true 50% and the gate
+        # stays shut; under a genuine signal it wins the held-out pairs and the
+        # gate opens. Counts are INTEGER and accumulate (no decay), so
+        # confidence tightens with data as a real McNemar test should — the
+        # decayed-sum-as-n scheme kept effective-n frozen at ~100 and locked
+        # out any learner below ~68% win-rate. `disc_b` = learner right &
+        # heuristic wrong; `disc_c` = the reverse. Concordant pairs carry no
+        # comparative signal and are ignored.
         self.events = 0
-        self.disc_b = 0.0  # learner correct, heuristic wrong
-        self.disc_c = 0.0  # heuristic correct, learner wrong
-        # Shorter decay → smaller effective-n → a more conservative Wilson
-        # bound. This is the defense against LABEL-NOISE MEMORIZATION: when the
-        # same candidate pairs recur under random feedback the learner can
-        # memorize their accidental labels and edge ~55% on discordant pairs;
-        # keeping effective-n modest means that thin edge never clears a 99.9%
-        # confidence bound, while a genuine signal (win-rate → 1.0) clears it
-        # immediately.
-        self.gate_decay = 0.99
+        self.disc_b = 0  # held-out: learner correct, heuristic wrong
+        self.disc_c = 0  # held-out: heuristic correct, learner wrong
+        self._pair_count = 0  # drives the deterministic train/eval split
+        self.EVAL_EVERY = 4  # ~25% of pairs held out for the gate
 
     # ── normalization ────────────────────────────────────────────────
     def observe(self, x: np.ndarray) -> None:
@@ -110,12 +108,12 @@ class OnlineRanker:
         return float(h @ W2 + b2)
 
     @staticmethod
-    def _wilson_lower(successes: float, n: float, z: float = 3.0) -> float:
-        """Wilson score lower bound for a binomial proportion (z=3.0 ≈ 99.9%).
+    def _wilson_lower(successes: float, n: float, z: float = 2.33) -> float:
+        """Wilson score lower bound for a binomial proportion (z=2.33 ≈ 99%).
 
-        Answers 'is the true win-rate confidently above p?' with small-sample
-        correctness — a raw ratio of 51% over thousands of noisy trials would
-        pass a naive threshold but fails this."""
+        With honest INTEGER counts this tightens as n grows, so a genuinely
+        (even modestly) better learner clears 0.5 once enough held-out pairs
+        accumulate — while true noise (p→0.5) never does."""
         if n <= 0:
             return 0.0
         p = successes / n
@@ -128,9 +126,9 @@ class OnlineRanker:
     def blend(self) -> float:
         """λ — how much the learned score participates.
 
-        Opens only when a McNemar paired test says the learner beats the
-        heuristic with statistical confidence (Wilson lower bound of the
-        discordant win-rate > 0.5), never on a numerical lead alone."""
+        Opens only when the OUT-OF-SAMPLE McNemar test says the learner beats
+        the heuristic with statistical confidence (Wilson 99% lower bound of
+        the held-out discordant win-rate > 0.5), never on a numerical lead."""
         if self.events < self.blend_min_events:
             return 0.0
         disc = self.disc_b + self.disc_c
@@ -152,31 +150,34 @@ class OnlineRanker:
 
     # ── learning ─────────────────────────────────────────────────────
     def update_pair(self, x_pos: np.ndarray, x_neg: np.ndarray) -> float:
-        """One pairwise logistic SGD step: used ranked above ignored.
+        """One pairwise step: used ranked above ignored.
 
-        Also referees learner-vs-heuristic on this pair for the blend gate.
-        Returns the pairwise loss (pre-update)."""
-        zp, zn = self._z(x_pos), self._z(x_neg)
-        # Referee BEFORE updating (out-of-sample for the learner). McNemar:
-        # count only the DISCORDANT pairs — exactly one ranker got it right.
+        Every EVAL_EVERY-th pair is HELD OUT — refereed for the blend gate but
+        NOT trained on (so the learner can never memorize it). The rest train
+        the live weights. Returns the pairwise loss (0.0 for held-out pairs)."""
         self.events += 1
-        learner_ok = self._mlp(zp) > self._mlp(zn)
-        heur_ok = float(_HEURISTIC_W @ zp) > float(_HEURISTIC_W @ zn)
-        if learner_ok != heur_ok:
-            self.disc_b = self.disc_b * self.gate_decay + (1.0 if learner_ok else 0.0)
-            self.disc_c = self.disc_c * self.gate_decay + (0.0 if learner_ok else 1.0)
-        else:
-            self.disc_b *= self.gate_decay
-            self.disc_c *= self.gate_decay
+        self._pair_count += 1
+        zp, zn = self._z(x_pos), self._z(x_neg)
 
-        # Forward on live (non-EMA) weights.
+        if self._pair_count % self.EVAL_EVERY == 0:
+            # HELD-OUT: out-of-sample McNemar referee, no training.
+            learner_ok = self._mlp(zp) > self._mlp(zn)
+            heur_ok = float(_HEURISTIC_W @ zp) > float(_HEURISTIC_W @ zn)
+            if learner_ok != heur_ok:
+                if learner_ok:
+                    self.disc_b += 1
+                else:
+                    self.disc_c += 1
+            return 0.0
+
+        # TRAIN: forward on live (non-EMA) weights.
         hp = self._gelu(zp @ self.W1 + self.b1)
         hn = self._gelu(zn @ self.W1 + self.b1)
         sp = float(hp @ self.W2 + self.b2)
         sn = float(hn @ self.W2 + self.b2)
         margin = sp - sn
-        loss = float(np.log1p(np.exp(-margin)))
-        g = -1.0 / (1.0 + np.exp(margin))  # dL/dmargin
+        loss = float(np.logaddexp(0.0, -margin))  # stable softplus (no overflow)
+        g = -1.0 / (1.0 + np.exp(min(margin, 30.0)))  # dL/dmargin, clamped
 
         # Backprop (manual, tiny).
         def back(z: np.ndarray, h: np.ndarray, sign: float):
@@ -219,6 +220,7 @@ class OnlineRanker:
             meta=json.dumps({
                 "n_norm": self.n_norm, "events": self.events,
                 "disc_b": self.disc_b, "disc_c": self.disc_c,
+                "pair_count": self._pair_count,
                 "lr": self.lr, "l2": self.l2, "blend_min_events": self.blend_min_events,
             }),
         )
@@ -235,8 +237,9 @@ class OnlineRanker:
         r.mu, r.var = data["mu"], data["var"]
         r.n_norm = meta["n_norm"]
         r.events = meta["events"]
-        r.disc_b = meta.get("disc_b", 0.0)
-        r.disc_c = meta.get("disc_c", 0.0)
+        r.disc_b = int(meta.get("disc_b", 0))
+        r.disc_c = int(meta.get("disc_c", 0))
+        r._pair_count = int(meta.get("pair_count", 0))
         return r
 
     def stats(self) -> Dict[str, float]:
@@ -244,7 +247,7 @@ class OnlineRanker:
         return {
             "events": float(self.events),
             "blend": self.blend,
-            "disc_b": self.disc_b,
-            "disc_c": self.disc_c,
+            "disc_b": float(self.disc_b),
+            "disc_c": float(self.disc_c),
             "win_rate": self.disc_b / disc if disc > 0 else 0.0,
         }

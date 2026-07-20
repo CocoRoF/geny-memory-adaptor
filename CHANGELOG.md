@@ -1,5 +1,57 @@
 # Changelog
 
+## [1.2.0] — 2026-07-20
+
+Adversarial-review hardening. Three independent reviewers (correctness,
+numerical/ML-theory, persistence/concurrency) found 11 reproduced defects
+before the Geny port; all fixed, each with a regression test.
+
+### Fixed — learning (the big one)
+- **Blend gate was effectively unreachable.** The decayed-McNemar scheme
+  froze effective-n at ~100, so a genuinely-but-modestly-better learner
+  (56–67% win-rate) could NEVER open the gate no matter how much data
+  arrived — the learner was dead outside a near-oracle regime. Rebuilt as an
+  **out-of-sample McNemar test**: ~25% of pairs are held out (never trained
+  on), refereed with **integer** counts + a Wilson 99% lower bound. A modest
+  real signal now opens the gate as data accumulates; noise (held-out
+  win-rate → 50%) never does. Verified: moderate learner (0.79) → λ 0.70;
+  noise (0.49) → λ 0; 17,600 random feedbacks stay shut.
+- **Pairwise loss overflowed to `inf`** on large negative margins — use a
+  stable softplus (`logaddexp`); gradient was already fine.
+
+### Fixed — persistence & concurrency
+- **Engine state had no lock** despite `check_same_thread=False`: concurrent
+  search/index/feedback raced on the caches and ranker ("dict changed size",
+  half-updated weights). One re-entrant lock now guards all public methods.
+- **distill left the embedder table and vectors mutually inconsistent on
+  crash.** The table lives in SQLite now (not a sidecar npz) and distill
+  swaps table + all re-embedded vectors in ONE atomic transaction. Also
+  removes the two-instance npz-clobber hazard.
+- **Store writes had no rollback** — a mid-write exception left a partial
+  transaction for the next commit. All multi-statement writes now roll back
+  on failure. Reads take the lock too (single shared connection).
+- **`text:<id>` params leaked forever** (never deleted on remove, duplicated
+  every body). Now gated by `store_text` (default on, needed for distill)
+  and cleaned up on remove().
+
+### Fixed — Korean correctness
+- Re-indexing a node with changed **links** left a dangling reverse edge
+  (LINK is now stored one-directional and symmetrized at query time).
+- Re-indexing with changed **tags** left stale tag-cache membership (cache
+  drops on re-index).
+- `remove()` didn't purge pending feedback tokens → could resurrect a deleted
+  node's edges/feedback rows.
+- `로` particle now strips after an ㄹ-final stem (서울로 → 서울), not just
+  vowel-final.
+
+### Changed
+- distill() returns a candidate table the engine applies atomically; needs
+  ≥24 teacher pairs and a held-out improvement margin (was: swap on a single
+  tiny-holdout wiggle, or never swap for small corpora).
+- Embedding table persists inside the db (`store_text`, `emb_path` removed).
+- executor_adapter offloads index/search/distill via `asyncio.to_thread`.
+
+
 ## [1.1.0] — 2026-07-20
 
 Deep-validation hardening — three real defects found by indexing **939 live

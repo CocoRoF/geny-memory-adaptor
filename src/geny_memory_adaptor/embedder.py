@@ -18,7 +18,7 @@ unless the new one actually correlates better with the teacher's geometry.
 from __future__ import annotations
 
 import io
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -64,6 +64,13 @@ class HashEmbedder:
         return (v / n).astype(np.float32) if n > 1e-9 else v.astype(np.float32)
 
     # ── distillation ────────────────────────────────────────────────
+    #: Below this many (text, teacher) pairs the held-out geometry correlation
+    #: is too noisy to trust — distillation trains nothing and reports it.
+    MIN_DISTILL_PAIRS = 24
+    #: The candidate table is accepted only if it beats the current one by more
+    #: than this correlation margin — guards against swapping on holdout noise.
+    DISTILL_MARGIN = 0.01
+
     def distill(
         self,
         pairs: Sequence[Tuple[str, np.ndarray]],
@@ -73,14 +80,18 @@ class HashEmbedder:
         batch: int = 64,
         seed: int = 7,
         holdout: float = 0.2,
-    ) -> Dict[str, float]:
-        """Fit the table to teacher vectors. Returns metrics; swaps the table
-        ONLY if the held-out pairwise-cosine correlation improves."""
-        if len(pairs) < 8:
-            return {"trained": 0.0, "reason_no_data": 1.0}
+    ) -> Dict[str, Any]:
+        """Fit a CANDIDATE table to teacher vectors. Does NOT mutate
+        ``self.table`` — returns the candidate under ``metrics['candidate']``
+        (an ndarray) only when it clears a held-out margin, else ``None``. The
+        caller applies + re-embeds atomically, so a partial distill is never
+        persisted. Needs ≥ MIN_DISTILL_PAIRS with a ≥5-item holdout."""
+        if len(pairs) < self.MIN_DISTILL_PAIRS:
+            return {"trained": 0.0, "reason_insufficient": 1.0,
+                    "pairs": float(len(pairs)), "candidate": None}
         rng = np.random.default_rng(seed)
         idx = rng.permutation(len(pairs))
-        n_hold = max(2, int(len(pairs) * holdout))
+        n_hold = max(5, int(len(pairs) * holdout))
         hold = [pairs[i] for i in idx[:n_hold]]
         train = [pairs[i] for i in idx[n_hold:]]
         d_t = int(hold[0][1].shape[0])
@@ -127,12 +138,10 @@ class HashEmbedder:
                     param -= lr * mh / (np.sqrt(vh) + eps)
 
         after = self._geometry_corr(hold, W)
-        if after > before:
-            self.table = W
-            return {"trained": 1.0, "corr_before": before, "corr_after": after,
-                    "swapped": 1.0, "pairs": float(len(pairs))}
+        accept = after > before + self.DISTILL_MARGIN
         return {"trained": 1.0, "corr_before": before, "corr_after": after,
-                "swapped": 0.0, "pairs": float(len(pairs))}
+                "swapped": 1.0 if accept else 0.0, "pairs": float(len(pairs)),
+                "candidate": W if accept else None}
 
     def _geometry_corr(self, hold: Sequence[Tuple[str, np.ndarray]], table: np.ndarray) -> float:
         """Pearson corr between local and teacher pairwise cosine matrices."""

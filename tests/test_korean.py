@@ -192,3 +192,10 @@ def test_agent_memory_hard_queries():
     # R@1 measured 0.95; 0.80 floor absorbs cross-platform embedding jitter
     # while still catching a real regression.
     assert at1 / len(QUERIES) >= 0.80, f"R@1 {at1}/{len(QUERIES)}"
+
+
+def test_strip_ro_after_rieul():
+    # 로 attaches after a vowel OR ㄹ-final stem — A4 fix.
+    assert strip_suffix("서울로") == "서울"   # 울: ㄹ 받침 + 로
+    assert strip_suffix("학교로") == "학교"   # vowel + 로
+    assert strip_suffix("집으로") == "집으"   # 으로 is multi-particle → 집 (handled table)

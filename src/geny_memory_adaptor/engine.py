@@ -1,7 +1,9 @@
 """SynapseMemory — the public engine: index / search / feedback / distill.
 
-One object per vault. All state lives in `<path>` (SQLite) + `<path>.emb.npz`
-(embedding table). Zero network calls; every operation is CPU-milliseconds.
+One object per vault. All state — vectors, edges, the learned ranker AND the
+embedding table — lives in the single `<path>` SQLite file. Zero network
+calls; every operation is CPU-milliseconds. All public methods are thread-safe
+(one re-entrant lock guards the caches, ranker, and embedder).
 
     mem = SynapseMemory.open(path="vault/synapse.db")     # or from_env()
     mem.index("note-1", "본문…", title="제목", tags=["게임"], links=["note-0"])
@@ -14,8 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import math
-import os
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
@@ -59,8 +61,6 @@ class SynapseMemory:
                                                       if k in SynapseConfig.__dataclass_fields__}})
         self.cfg = cfg
         self.store = Store(cfg.path)
-        self._emb_path = cfg.emb_path or (
-            "" if cfg.path == ":memory:" else cfg.path + ".emb.npz")
         self.embedder = self._load_embedder()
         self.ranker = self._load_ranker()
         # Incremental caches — the difference between O(N) and O(N²) bulk
@@ -74,6 +74,13 @@ class SynapseMemory:
         #: query_token → {"hash":…, "features": {node_id: np.ndarray}, "shown": [ids]}
         self._recent_queries: Dict[str, Dict[str, Any]] = {}
         self._rng = random.Random(cfg.seed)
+        # One re-entrant lock guards ALL mutable engine state (caches, ranker,
+        # embedder, _recent_queries, _rng). The Store has its own lock for
+        # SQLite, but these Python structures are mutated by index/search/
+        # feedback/distill/remove and must not interleave across threads —
+        # ``check_same_thread=False`` means callers CAN hit one instance from
+        # several threads (e.g. a search turn + a background feedback).
+        self._lock = threading.RLock()
 
     # ── construction helpers ─────────────────────────────────────────
     @classmethod
@@ -88,11 +95,6 @@ class SynapseMemory:
     def _load_embedder(self) -> HashEmbedder:
         kw = dict(seed=self.cfg.seed, char_ngrams=self.cfg.char_ngrams,
                   jamo_ngrams=self.cfg.jamo_ngrams, suffix_strip=self.cfg.suffix_strip)
-        if self._emb_path and os.path.isfile(self._emb_path):
-            try:
-                return HashEmbedder.load(self._emb_path, **kw)
-            except Exception:
-                pass
         blob = self.store.get_param("embedder")
         if blob:
             try:
@@ -133,71 +135,99 @@ class SynapseMemory:
         caller happens to have (e.g. a stored API embedding) — used only as a
         distillation label, never required.
         """
-        body = f"{title}\n{text}" if title else text
-        # LEXICAL stream → BM25 postings (words + stems + syllable bigrams +
-        # cross-space bigrams). The jamo-augmented EMBEDDING stream lives only
-        # inside the hash embedder.
-        tok_kw = dict(char_ngrams=self.cfg.char_ngrams,
-                      suffix_strip=self.cfg.suffix_strip,
-                      cross_space=self.cfg.cross_space)
-        tokens = lexical_tokens(body, limit=self.cfg.max_doc_tokens, **tok_kw)
-        self.store.upsert_node(
-            node_id, kind=kind, title=title, tags=tags, text_len=len(tokens),
-            updated_at=updated_at or time.time(), pinned=pinned, importance=importance)
-        # BM25F-lite: title terms weigh title_boost× (the title already appears
-        # once inside `body`, so the extra weight is title_boost−1).
-        tf = term_frequencies(tokens)
-        if title and self.cfg.title_boost > 1.0:
-            extra = self.cfg.title_boost - 1.0
-            for t in set(lexical_tokens(title, limit=64, **tok_kw)):
-                tf[t] = tf.get(t, 0.0) + extra
-        self.store.replace_postings(node_id, tf)
-        vec = self.embedder.embed(body, limit=self.cfg.max_doc_tokens)
-        self.store.put_vector(node_id, pack_vec(vec), self.cfg.dim)
-        # Incremental cache maintenance (never a full invalidate on write).
-        if self._vec_cache is not None:
-            self._vec_cache[node_id] = vec
-        self._vec_matrix = None
-        if self._doclen_cache is not None:
-            self._doclen_cache[node_id] = len(tokens)
-        if self._tag_cache is not None:
-            for t in tags:
-                members = self._tag_cache.setdefault(t, [])
-                if node_id not in members:
-                    members.append(node_id)
-        # Edges: explicit links (bidirectional), tags, semantic kNN.
-        self.store.replace_edges_from(
-            node_id, EDGE_LINK, [(dst, 1.0) for dst in links])
-        if links:
-            self.store.upsert_edges([(dst, node_id, EDGE_LINK, 1.0) for dst in links])
-        self.store.replace_edges_from(
-            node_id, EDGE_TAG,
-            derive_tag_edges(self._tags_map(), self._n_docs(), node_id, tags,
-                             fanout=self.cfg.tag_fanout))
-        vectors = self._vectors()
-        self.store.replace_edges_from(
-            node_id, EDGE_KNN,
-            derive_knn_edges(vec, vectors, node_id,
-                             k=self.cfg.knn_edges, min_sim=self.cfg.knn_min_sim))
-        self._adj_cache.clear()
-        if teacher_vec is not None:
-            t = np.asarray(teacher_vec, dtype=np.float32)
-            self.store.put_teacher(node_id, teacher_model, pack_vec(t), int(t.shape[0]))
-        self._save_text_for_distill(node_id, body)
+        with self._lock:
+            existing = self.store.get_node(node_id)  # None ⇒ fresh insert
+            body = f"{title}\n{text}" if title else text
+            # LEXICAL stream → BM25 postings (words + stems + syllable bigrams
+            # + cross-space bigrams). The jamo-augmented EMBEDDING stream lives
+            # only inside the hash embedder.
+            tok_kw = dict(char_ngrams=self.cfg.char_ngrams,
+                          suffix_strip=self.cfg.suffix_strip,
+                          cross_space=self.cfg.cross_space)
+            tokens = lexical_tokens(body, limit=self.cfg.max_doc_tokens, **tok_kw)
+            self.store.upsert_node(
+                node_id, kind=kind, title=title, tags=tags, text_len=len(tokens),
+                updated_at=updated_at or time.time(), pinned=pinned, importance=importance)
+            # BM25F-lite: title terms weigh title_boost× (the title already
+            # appears once inside `body`, so the extra weight is title_boost−1).
+            tf = term_frequencies(tokens)
+            if title and self.cfg.title_boost > 1.0:
+                extra = self.cfg.title_boost - 1.0
+                for t in set(lexical_tokens(title, limit=64, **tok_kw)):
+                    tf[t] = tf.get(t, 0.0) + extra
+            self.store.replace_postings(node_id, tf)
+            vec = self.embedder.embed(body, limit=self.cfg.max_doc_tokens)
+            self.store.put_vector(node_id, pack_vec(vec), self.cfg.dim)
+
+            # Cache maintenance. On a RE-INDEX the tag set may have changed, so
+            # an incremental "append to new tags" leaves the node listed under
+            # its OLD tags — drop the whole tag cache and let it rebuild. Fresh
+            # inserts stay incremental (fast bulk indexing).
+            if self._vec_cache is not None:
+                self._vec_cache[node_id] = vec
+            self._vec_matrix = None
+            if self._doclen_cache is not None:
+                self._doclen_cache[node_id] = len(tokens)
+            if existing is not None:
+                self._tag_cache = None
+            elif self._tag_cache is not None:
+                for t in tags:
+                    members = self._tag_cache.setdefault(t, [])
+                    if node_id not in members:
+                        members.append(node_id)
+
+            # Edges. LINK is stored ONE-directional (only what this node
+            # declares) and symmetrized at query time in build_type_adjacency —
+            # so re-indexing with a changed link set can't leave a dangling
+            # reverse edge (the old bug: reverse edges had src=<other>, which
+            # replace_edges_from never cleans).
+            self.store.replace_edges_from(
+                node_id, EDGE_LINK, [(dst, 1.0) for dst in links])
+            self.store.replace_edges_from(
+                node_id, EDGE_TAG,
+                derive_tag_edges(self._tags_map(), self._n_docs(), node_id, tags,
+                                 fanout=self.cfg.tag_fanout))
+            vectors = self._vectors()
+            self.store.replace_edges_from(
+                node_id, EDGE_KNN,
+                derive_knn_edges(vec, vectors, node_id,
+                                 k=self.cfg.knn_edges, min_sim=self.cfg.knn_min_sim))
+            self._adj_cache.clear()
+            # Distillation labels + text are kept ONLY for nodes that carry a
+            # teacher vector — otherwise every note body was duplicated into the
+            # params table forever (a disk/RAM leak, never cleaned on remove).
+            if teacher_vec is not None:
+                t = np.asarray(teacher_vec, dtype=np.float32)
+                self.store.put_teacher(node_id, teacher_model, pack_vec(t), int(t.shape[0]))
+            if self.cfg.store_text:
+                self._save_text_for_distill(node_id, body)
 
     def remove(self, node_id: str) -> None:
-        self.store.remove_node(node_id)
-        if self._vec_cache is not None:
-            self._vec_cache.pop(node_id, None)
-        self._vec_matrix = None
-        if self._doclen_cache is not None:
-            self._doclen_cache.pop(node_id, None)
-        self._tag_cache = None
-        self._adj_cache.clear()
+        with self._lock:
+            self.store.remove_node(node_id)
+            self.store.delete_param(f"text:{node_id}")
+            if self._vec_cache is not None:
+                self._vec_cache.pop(node_id, None)
+            self._vec_matrix = None
+            if self._doclen_cache is not None:
+                self._doclen_cache.pop(node_id, None)
+            self._tag_cache = None
+            self._adj_cache.clear()
+            # Drop any pending feedback tokens that reference this node — else
+            # feedback() could reinforce co-access edges or re-insert feedback
+            # rows pointing at a now-deleted node.
+            for tok in list(self._recent_queries):
+                if node_id in self._recent_queries[tok]["features"]:
+                    del self._recent_queries[tok]
 
     # ── read path ────────────────────────────────────────────────────
     def search(self, query: str, *, top_k: Optional[int] = None,
                kinds: Optional[Sequence[str]] = None) -> List[SearchHit]:
+        with self._lock:
+            return self._search(query, top_k=top_k, kinds=kinds)
+
+    def _search(self, query: str, *, top_k: Optional[int] = None,
+                kinds: Optional[Sequence[str]] = None) -> List[SearchHit]:
         top_k = top_k or self.cfg.top_k
         q_tokens = lexical_tokens(query, char_ngrams=self.cfg.char_ngrams,
                                   suffix_strip=self.cfg.suffix_strip,
@@ -316,6 +346,13 @@ class SynapseMemory:
         co-access reinforcement, pairwise ranker SGD (event + small replay),
         and persists everything. Cost: microseconds-to-ms.
         """
+        with self._lock:
+            return self._feedback(query_token, used_ids=used_ids,
+                                  ignored_ids=ignored_ids, label_src=label_src)
+
+    def _feedback(self, query_token: str, *, used_ids: Sequence[str] = (),
+                  ignored_ids: Optional[Sequence[str]] = None,
+                  label_src: str = "implicit") -> Dict[str, float]:
         q = self._recent_queries.get(query_token)
         if q is None:
             return {"applied": 0.0}
@@ -366,44 +403,54 @@ class SynapseMemory:
         return done
 
     # ── distillation ────────────────────────────────────────────────
-    def distill(self, *, epochs: Optional[int] = None) -> Dict[str, float]:
-        """Fit the embedding table to stored teacher vectors (if any), then
-        RE-EMBED every node with the improved table. Bounded batch job —
-        run at session close / idle, never on the hot path."""
-        teachers = self.store.teachers()
-        texts = self._distill_texts()
-        pairs = []
-        for node_id, _model, dim, blob in teachers:
-            text = texts.get(node_id)
-            if not text:
-                continue
-            pairs.append((text, unpack_vec(blob, dim)))
-        metrics = self.embedder.distill(
-            pairs, epochs=epochs or self.cfg.distill_epochs,
-            lr=self.cfg.distill_lr, batch=self.cfg.distill_batch)
-        if metrics.get("swapped"):
-            for node_id, text in texts.items():
-                vec = self.embedder.embed(text, limit=self.cfg.max_doc_tokens)
-                self.store.put_vector(node_id, pack_vec(vec), self.cfg.dim)
-            self._vec_cache = None
-        self._persist_models()
-        return metrics
+    def distill(self, *, epochs: Optional[int] = None) -> Dict[str, Any]:
+        """Fit the embedding table to stored teacher vectors, then ATOMICALLY
+        swap the table and re-embed every stored-text node in one transaction.
+        Needs ``store_text=True`` (the whole corpus must be re-embeddable) and
+        enough teacher pairs. Bounded batch job — run at idle / close."""
+        with self._lock:
+            if not self.cfg.store_text:
+                return {"trained": 0.0, "reason_no_text": 1.0}
+            teachers = self.store.teachers()
+            texts = self._distill_texts()
+            pairs = [(texts[nid], unpack_vec(blob, dim))
+                     for nid, _m, dim, blob in teachers if texts.get(nid)]
+            metrics = self.embedder.distill(
+                pairs, epochs=epochs or self.cfg.distill_epochs,
+                lr=self.cfg.distill_lr, batch=self.cfg.distill_batch)
+            candidate = metrics.pop("candidate", None)
+            if candidate is not None:
+                # Apply on a scratch embedder, re-embed EVERY node with it, then
+                # commit the table + all vectors in ONE transaction. A crash
+                # rolls back both together — the stored table and its vectors
+                # can never disagree.
+                self.embedder.table = candidate
+                rows = [(nid, self.cfg.dim,
+                         pack_vec(self.embedder.embed(txt, limit=self.cfg.max_doc_tokens)))
+                        for nid, txt in texts.items()]
+                self.store.swap_embedder_and_vectors(self.embedder.dumps(), rows)
+                self._vec_cache = None
+                self._vec_matrix = None
+            self._persist_ranker()
+            return metrics
 
     # ── misc ─────────────────────────────────────────────────────────
     def stats(self) -> Dict[str, Any]:
-        return {
-            "nodes": self.store.count_nodes(),
-            "feedback_rows": self.store.feedback_count(),
-            "edges": {name: len(self.store.edges_by_type(t)) for name, t in
-                      (("link", EDGE_LINK), ("tag", EDGE_TAG),
-                       ("knn", EDGE_KNN), ("coaccess", EDGE_COACCESS))},
-            "ranker": self.ranker.stats(),
-            "dim": self.cfg.dim,
-        }
+        with self._lock:
+            return {
+                "nodes": self.store.count_nodes(),
+                "feedback_rows": self.store.feedback_count(),
+                "edges": {name: len(self.store.edges_by_type(t)) for name, t in
+                          (("link", EDGE_LINK), ("tag", EDGE_TAG),
+                           ("knn", EDGE_KNN), ("coaccess", EDGE_COACCESS))},
+                "ranker": self.ranker.stats(),
+                "dim": self.cfg.dim,
+            }
 
     def close(self) -> None:
-        self._persist_models()
-        self.store.close()
+        with self._lock:
+            self._persist_models()
+            self.store.close()
 
     def __enter__(self) -> "SynapseMemory":
         return self
@@ -464,15 +511,10 @@ class SynapseMemory:
         self.store.put_param("ranker", self.ranker.dumps())
 
     def _persist_embedder(self) -> None:
-        """Persist the embedding table — 32 MB, so ONLY after distillation
-        actually mutates it (never on the feedback hot path). Writing it every
-        feedback was a 14 s/20-call zlib bottleneck."""
-        if self._emb_path:
-            try:
-                self.embedder.save(self._emb_path)
-                return
-            except OSError:
-                pass
+        """Persist the embedding table (~fp16, tens of MB) — ONLY after
+        distillation actually mutates it, never on the feedback hot path
+        (writing it every feedback was a 14 s/20-call zlib bottleneck). Lives
+        in the same db as the vectors so distill can swap both atomically."""
         self.store.put_param("embedder", self.embedder.dumps())
 
     def _persist_models(self) -> None:

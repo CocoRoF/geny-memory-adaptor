@@ -182,6 +182,15 @@ def build_type_adjacency(
     if etype == EDGE_COACCESS:
         edges = [(s, d, w * (coaccess_decay ** max(0.0, (now - u) / _WEEK)))
                  for s, d, w, u in rows]
+    elif etype == EDGE_LINK:
+        # LINK is stored one-directional (what each node declares); treat it as
+        # UNDIRECTED for propagation. Symmetrizing here — instead of persisting
+        # reverse edges — means a node's link set is fully described by its own
+        # rows, so re-indexing can never orphan a reverse edge.
+        edges = []
+        for s, d, w, _u in rows:
+            edges.append((s, d, w))
+            edges.append((d, s, w))
     else:
         edges = [(s, d, w) for s, d, w, _u in rows]
     return build_adjacency(edges)
