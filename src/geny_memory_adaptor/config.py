@@ -66,8 +66,19 @@ class SynapseConfig:
     seed: int = 41
 
     # ── tokenizer ──
-    #: Character n-gram sizes indexed alongside word tokens (Korean-friendly).
-    char_ngrams: tuple = (2, 3)
+    #: Syllable n-gram sizes for the LEXICAL (BM25) stream. Bigrams only by
+    #: default — the NTCIR-validated sweet spot; trigrams cost 2-3× for no
+    #: measured gain.
+    char_ngrams: tuple = (2,)
+    #: Jamo n-gram sizes for the EMBEDDING stream only (typo robustness).
+    #: 3/5 per the ACL 2018 Korean subword recipe; jamo bigrams hurt.
+    jamo_ngrams: tuple = (3, 5)
+    #: Additionally index a guarded 조사-stripped stem next to each surface word.
+    suffix_strip: bool = True
+    #: Cross-space syllable bigrams (붙여쓰기 robustness) in the BM25 stream.
+    cross_space: bool = True
+    #: BM25F-lite: title terms count this many times in the postings.
+    title_boost: float = 2.0
     #: Per-document token cap (indexing) / per-query cap.
     max_doc_tokens: int = 2048
     max_query_tokens: int = 256

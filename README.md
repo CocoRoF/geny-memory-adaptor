@@ -107,11 +107,32 @@ handle = SynapseVectorHandle(SynapseMemory.open("vault/synapse.db"))
 # → FileMemoryProvider(vector_store=handle)  # drop-in local vector layer
 ```
 
+## Korean retrieval (v1.0.0 — the headline feature)
+
+Korean is a first-class citizen, engineered from NTCIR/ACL evidence and
+measured on a committed [MIRACL-ko](https://huggingface.co/datasets/miracl/miracl)
+harness (213 human-judged queries / 2,835 wiki passages, Apache-2.0):
+
+- **No morphological analyzer needed**: overlapping syllable **bigrams**
+  (the NTCIR-validated recipe; trigrams measured −2.5 nDCG and are excluded),
+  a **guarded 조사/어미 stripper** (받침-agreement gate, '의' protected,
+  하다-family only — +1.6 nDCG), **cross-space bigrams** for 붙여쓰기, and
+  padded **jamo 3/5-grams in the embedding stream only** (+1.8 nDCG; keeping
+  jamo out of BM25 avoids a measured 3× slowdown).
+- **Hybrid nDCG@10 0.593 · MRR@10 0.597 · R@10 0.911** on the harness —
+  near analyzer-based BM25 (nori ≈ 0.64 on comparable data), pure Python.
+- Robustness axes measured (Δ R@5 vs clean): 붙여쓰기 ±0.00 · 조사 변형
+  +0.02 · 자모 오타 −0.02 — the failure modes that break word-level Korean
+  search simply don't apply.
+- CI regression gate pins the quality floor (nDCG ≥ 0.55 on the fixture).
+
+Run it yourself: `python eval/run_eval.py` (offline) · `python eval/ablation.py`.
+
 ## Benchmarks (single CPU core, this repo's `tests/bench.py`)
 
 ```
 index : 500 docs 0.32 ms/doc · 2,000 docs 0.71 ms/doc
-search: 500 docs 3.1 ms     · 2,000 docs 8.7 ms
+search: ~3–16 ms/query at 500–2,800 docs (jamo embedding stream included)
 learn : ambiguous-query demo — mean target rank 7.0 → 2.8 after 80 feedbacks
 distill: 120 pairs, geometry corr 0.975 → 0.983, gate-approved swap, 8.5 s
 ```

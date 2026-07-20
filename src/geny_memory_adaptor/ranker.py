@@ -27,9 +27,11 @@ N_FEATURES = len(FEATURES)
 #: The heuristic floor: fixed weights over z-normalized features (mirrors a
 #: sane hand-tuned engine: semantic + keyword dominate, graph/recency assist).
 _HEURISTIC_W = np.array([
-    0.9,   # bm25
-    1.0,   # cosine
-    0.8,   # rrf
+    1.2,   # bm25 — measured stronger than the undistilled hash cosine on the
+           # MIRACL-ko harness; distillation shifts this balance and the
+           # LEARNED ranker re-weights it per-vault at runtime.
+    0.6,   # cosine
+    0.9,   # rrf
     0.45,  # ppr_link
     0.25,  # ppr_tag
     0.35,  # ppr_knn

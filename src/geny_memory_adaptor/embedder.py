@@ -22,15 +22,19 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from .tokenizer import fnv1a, tokenize
+from .tokenizer import fnv1a_pair, tokenize
 
 
 class HashEmbedder:
     def __init__(self, vocab_size: int, dim: int, *, seed: int = 41,
-                 char_ngrams: Sequence[int] = (2, 3)) -> None:
+                 char_ngrams: Sequence[int] = (2, 3),
+                 jamo_ngrams: Sequence[int] = (3, 5),
+                 suffix_strip: bool = True) -> None:
         self.vocab_size = vocab_size
         self.dim = dim
         self.char_ngrams = tuple(char_ngrams)
+        self.jamo_ngrams = tuple(jamo_ngrams)
+        self.suffix_strip = suffix_strip
         rng = np.random.default_rng(seed)
         # fp32 master table; persisted as fp16 to halve disk. Scaled so that
         # mean-pooled vectors have a sane norm pre-normalization.
@@ -38,16 +42,24 @@ class HashEmbedder:
 
     # ── inference ────────────────────────────────────────────────────
     def bucket_ids(self, text: str, *, limit: int = 2048) -> np.ndarray:
-        toks = tokenize(text, char_ngrams=self.char_ngrams, limit=limit)
+        """Bloom-style k=2 bucket ids, shape (n_tokens, 2).
+
+        Two independent hash views per token make total collisions ~(1/B)²
+        (NeurIPS 2017 hash embeddings) — a single hash over a jamo+syllable
+        n-gram vocabulary collides badly at 2^16 buckets."""
+        toks = tokenize(text, char_ngrams=self.char_ngrams,
+                        jamo_ngrams=self.jamo_ngrams,
+                        suffix_strip=self.suffix_strip, limit=limit)
         if not toks:
-            return np.zeros(0, dtype=np.int64)
-        return np.fromiter((fnv1a(t, self.vocab_size) for t in toks), dtype=np.int64)
+            return np.zeros((0, 2), dtype=np.int64)
+        return np.array([fnv1a_pair(t, self.vocab_size) for t in toks], dtype=np.int64)
 
     def embed(self, text: str, *, limit: int = 2048) -> np.ndarray:
         ids = self.bucket_ids(text, limit=limit)
         if ids.size == 0:
             return np.zeros(self.dim, dtype=np.float32)
-        v = self.table[ids].mean(axis=0)
+        # e_token = (W[h1] + W[h2]) / 2, mean-pooled over tokens.
+        v = (self.table[ids[:, 0]] + self.table[ids[:, 1]]).mean(axis=0) * 0.5
         n = float(np.linalg.norm(v))
         return (v / n).astype(np.float32) if n > 1e-9 else v.astype(np.float32)
 
@@ -96,12 +108,13 @@ class HashEmbedder:
                     ids = train_ids[j]
                     if ids.size == 0:
                         continue
-                    e = W[ids].mean(axis=0)                     # (d,)
+                    e = (W[ids[:, 0]] + W[ids[:, 1]]).mean(axis=0) * 0.5  # (d,)
                     pred = P @ e                                # (d_t,)
                     err = pred - teachers[j]                    # (d_t,)
                     gP += np.outer(err, e)
-                    ge = P.T @ err / ids.size                   # (d,)
-                    np.add.at(gW, ids, ge)
+                    ge = P.T @ err * (0.5 / ids.shape[0])       # (d,)
+                    np.add.at(gW, ids[:, 0], ge)
+                    np.add.at(gW, ids[:, 1], ge)
                 scale = 1.0 / max(1, len(chunk))
                 gW *= scale
                 gP *= scale
@@ -131,7 +144,7 @@ class HashEmbedder:
             ids = self.bucket_ids(text)
             if ids.size == 0:
                 continue
-            v = table[ids].mean(axis=0)
+            v = (table[ids[:, 0]] + table[ids[:, 1]]).mean(axis=0) * 0.5
             v = v / (np.linalg.norm(v) + 1e-9)
             local.append(v)
             teach.append(tvec / (np.linalg.norm(tvec) + 1e-9))
@@ -153,10 +166,13 @@ class HashEmbedder:
 
     @classmethod
     def loads(cls, blob: bytes, *, seed: int = 41,
-              char_ngrams: Sequence[int] = (2, 3)) -> "HashEmbedder":
+              char_ngrams: Sequence[int] = (2, 3),
+              jamo_ngrams: Sequence[int] = (3, 5),
+              suffix_strip: bool = True) -> "HashEmbedder":
         data = np.load(io.BytesIO(blob))
         vocab_size, dim = (int(x) for x in data["meta"])
-        emb = cls(vocab_size, dim, seed=seed, char_ngrams=char_ngrams)
+        emb = cls(vocab_size, dim, seed=seed, char_ngrams=char_ngrams,
+                  jamo_ngrams=jamo_ngrams, suffix_strip=suffix_strip)
         emb.table = data["table"].astype(np.float32)
         return emb
 

@@ -34,7 +34,7 @@ from .graph import (
 )
 from .ranker import FEATURES, OnlineRanker
 from .store import EDGE_COACCESS, EDGE_KNN, EDGE_LINK, EDGE_TAG, Store
-from .tokenizer import tokenize
+from .tokenizer import lexical_tokens
 
 _KIND_PRIOR = {"fact": 1.0, "insight": 0.8, "note": 0.5, "digest": 0.4, "turn": 0.2}
 
@@ -86,21 +86,20 @@ class SynapseMemory:
         return cls(SynapseConfig.from_env(dotenv=dotenv, **overrides))
 
     def _load_embedder(self) -> HashEmbedder:
+        kw = dict(seed=self.cfg.seed, char_ngrams=self.cfg.char_ngrams,
+                  jamo_ngrams=self.cfg.jamo_ngrams, suffix_strip=self.cfg.suffix_strip)
         if self._emb_path and os.path.isfile(self._emb_path):
             try:
-                return HashEmbedder.load(self._emb_path, seed=self.cfg.seed,
-                                         char_ngrams=self.cfg.char_ngrams)
+                return HashEmbedder.load(self._emb_path, **kw)
             except Exception:
                 pass
         blob = self.store.get_param("embedder")
         if blob:
             try:
-                return HashEmbedder.loads(blob, seed=self.cfg.seed,
-                                          char_ngrams=self.cfg.char_ngrams)
+                return HashEmbedder.loads(blob, **kw)
             except Exception:
                 pass
-        return HashEmbedder(self.cfg.vocab_size, self.cfg.dim, seed=self.cfg.seed,
-                            char_ngrams=self.cfg.char_ngrams)
+        return HashEmbedder(self.cfg.vocab_size, self.cfg.dim, **kw)
 
     def _load_ranker(self) -> OnlineRanker:
         blob = self.store.get_param("ranker")
@@ -135,12 +134,24 @@ class SynapseMemory:
         distillation label, never required.
         """
         body = f"{title}\n{text}" if title else text
-        tokens = tokenize(body, char_ngrams=self.cfg.char_ngrams,
-                          limit=self.cfg.max_doc_tokens)
+        # LEXICAL stream → BM25 postings (words + stems + syllable bigrams +
+        # cross-space bigrams). The jamo-augmented EMBEDDING stream lives only
+        # inside the hash embedder.
+        tok_kw = dict(char_ngrams=self.cfg.char_ngrams,
+                      suffix_strip=self.cfg.suffix_strip,
+                      cross_space=self.cfg.cross_space)
+        tokens = lexical_tokens(body, limit=self.cfg.max_doc_tokens, **tok_kw)
         self.store.upsert_node(
             node_id, kind=kind, title=title, tags=tags, text_len=len(tokens),
             updated_at=updated_at or time.time(), pinned=pinned, importance=importance)
-        self.store.replace_postings(node_id, term_frequencies(tokens))
+        # BM25F-lite: title terms weigh title_boost× (the title already appears
+        # once inside `body`, so the extra weight is title_boost−1).
+        tf = term_frequencies(tokens)
+        if title and self.cfg.title_boost > 1.0:
+            extra = self.cfg.title_boost - 1.0
+            for t in set(lexical_tokens(title, limit=64, **tok_kw)):
+                tf[t] = tf.get(t, 0.0) + extra
+        self.store.replace_postings(node_id, tf)
         vec = self.embedder.embed(body, limit=self.cfg.max_doc_tokens)
         self.store.put_vector(node_id, pack_vec(vec), self.cfg.dim)
         # Incremental cache maintenance (never a full invalidate on write).
@@ -188,8 +199,10 @@ class SynapseMemory:
     def search(self, query: str, *, top_k: Optional[int] = None,
                kinds: Optional[Sequence[str]] = None) -> List[SearchHit]:
         top_k = top_k or self.cfg.top_k
-        q_tokens = tokenize(query, char_ngrams=self.cfg.char_ngrams,
-                            limit=self.cfg.max_query_tokens)
+        q_tokens = lexical_tokens(query, char_ngrams=self.cfg.char_ngrams,
+                                  suffix_strip=self.cfg.suffix_strip,
+                                  cross_space=self.cfg.cross_space,
+                                  limit=self.cfg.max_query_tokens)
         now = time.time()
 
         # ① seeds — BM25 ∪ cosine, fused by RRF.
@@ -239,7 +252,8 @@ class SynapseMemory:
             if kinds and node["kind"] not in kinds:
                 continue
             age_days = max(0.0, (now - (node["updated_at"] or now)) / 86400.0)
-            title_words = set(tokenize(node["title"], char_ngrams=(), limit=32))
+            title_words = set(lexical_tokens(node["title"], char_ngrams=(),
+                                             cross_space=False, limit=32))
             x = np.array([
                 bm25.get(nid, 0.0),
                 cos.get(nid, 0.0),
