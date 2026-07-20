@@ -186,11 +186,16 @@ def build_type_adjacency(
         # LINK is stored one-directional (what each node declares); treat it as
         # UNDIRECTED for propagation. Symmetrizing here — instead of persisting
         # reverse edges — means a node's link set is fully described by its own
-        # rows, so re-indexing can never orphan a reverse edge.
-        edges = []
+        # rows, so re-indexing can never orphan a reverse edge. Dedup by pair
+        # (max weight) so a MUTUAL link (A→B and B→A both declared) counts once,
+        # not twice, in the row-normalized adjacency.
+        pair_w: Dict[Tuple[str, str], float] = {}
         for s, d, w, _u in rows:
-            edges.append((s, d, w))
-            edges.append((d, s, w))
+            for a, b in ((s, d), (d, s)):
+                key = (a, b)
+                if w > pair_w.get(key, 0.0):
+                    pair_w[key] = w
+        edges = [(a, b, w) for (a, b), w in pair_w.items()]
     else:
         edges = [(s, d, w) for s, d, w, _u in rows]
     return build_adjacency(edges)

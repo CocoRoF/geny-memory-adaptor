@@ -65,23 +65,23 @@ class OnlineRanker:
         self.var = np.ones(N_FEATURES, dtype=np.float32)
         self.n_norm = 0
         # Blend gate — a McNemar paired test of learner-vs-heuristic evaluated
-        # STRICTLY OUT-OF-SAMPLE. Every ~1-in-EVAL_EVERY pair is held out as
-        # eval-only: the learner is NEVER trained on it, only judged. This is
-        # the real defense against label-noise memorization — the learner
-        # cannot memorize a held-out pair's accidental label, so under random
-        # feedback its held-out discordant win-rate is a true 50% and the gate
-        # stays shut; under a genuine signal it wins the held-out pairs and the
-        # gate opens. Counts are INTEGER and accumulate (no decay), so
-        # confidence tightens with data as a real McNemar test should — the
-        # decayed-sum-as-n scheme kept effective-n frozen at ~100 and locked
-        # out any learner below ~68% win-rate. `disc_b` = learner right &
-        # heuristic wrong; `disc_c` = the reverse. Concordant pairs carry no
-        # comparative signal and are ignored.
+        # STRICTLY OUT-OF-SAMPLE. The host holds out a deterministic slice of
+        # QUERIES (by query hash) and feeds their pairs to referee_pair(), never
+        # to update_pair() — so the learner truly never trains on them. That
+        # query-level split (not a per-call ordinal) is what keeps replayed,
+        # already-trained pairs out of the referee. Under random feedback the
+        # held-out discordant win-rate is a true 50% and the gate stays shut;
+        # under a genuine signal it wins the held-out queries and opens. Counts
+        # are INTEGER and accumulate (no decay), so confidence tightens with
+        # data. `disc_b` = learner right & heuristic wrong; `disc_c` = reverse;
+        # concordant pairs carry no comparative signal.
         self.events = 0
         self.disc_b = 0  # held-out: learner correct, heuristic wrong
         self.disc_c = 0  # held-out: heuristic correct, learner wrong
-        self._pair_count = 0  # drives the deterministic train/eval split
-        self.EVAL_EVERY = 4  # ~25% of pairs held out for the gate
+
+    #: The blend gate needs the Wilson lower bound of the held-out win-rate to
+    #: clear THIS (a margin above 0.5), so noise near 50% can't open it.
+    _GATE_FLOOR = 0.52
 
     # ── normalization ────────────────────────────────────────────────
     def observe(self, x: np.ndarray) -> None:
@@ -91,8 +91,18 @@ class OnlineRanker:
         self.mu += delta / k
         self.var += (delta * (x - self.mu) - self.var) / k
 
+    #: z-scores are clipped to ±this. A near-constant feature (every candidate
+    #: shares a kind_prior, or all-zero ppr) drives `var → 0`, and (x−mu)/√var
+    #: then explodes — on a small corpus that made absolute scores swing 100×
+    #: across warmup. Clipping caps that WITHOUT rescaling informative features
+    #: (whose |z| < clip), so ranking quality is unchanged on real corpora
+    #: while the blow-up is contained. Cheaper and less distorting than a
+    #: variance floor, which shifts every feature's scale.
+    _Z_CLIP = 8.0
+
     def _z(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.mu) / np.sqrt(self.var + 1e-6)
+        z = (x - self.mu) / np.sqrt(self.var + 1e-6)
+        return np.clip(z, -self._Z_CLIP, self._Z_CLIP)
 
     # ── scoring ──────────────────────────────────────────────────────
     @staticmethod
@@ -108,12 +118,15 @@ class OnlineRanker:
         return float(h @ W2 + b2)
 
     @staticmethod
-    def _wilson_lower(successes: float, n: float, z: float = 2.33) -> float:
-        """Wilson score lower bound for a binomial proportion (z=2.33 ≈ 99%).
+    def _wilson_lower(successes: float, n: float, z: float = 3.0) -> float:
+        """Wilson score lower bound for a binomial proportion (z=3.0 ≈ 99.9%).
 
         With honest INTEGER counts this tightens as n grows, so a genuinely
-        (even modestly) better learner clears 0.5 once enough held-out pairs
-        accumulate — while true noise (p→0.5) never does."""
+        better learner clears 0.5 once enough held-out pairs accumulate. The
+        conservative z absorbs the residual document-level overlap between the
+        held-out and trained queries (a held-out QUERY is out-of-sample, but
+        its candidate DOCUMENTS can still appear in trained queries), which
+        would otherwise let noise edge a few points over 0.5."""
         if n <= 0:
             return 0.0
         p = successes / n
@@ -135,10 +148,13 @@ class OnlineRanker:
         if disc < 20:
             return 0.0
         lower = self._wilson_lower(self.disc_b, disc)
-        if lower <= 0.5:
+        # Require the confident win-rate to clear 0.52, not just 0.5 — a 2-point
+        # margin above the coin-flip that residual document overlap can't fake,
+        # so noise (which tops out just over 0.50) never opens the gate while a
+        # real edge still does.
+        if lower <= self._GATE_FLOOR:
             return 0.0
-        # Map the confidence margin above 0.5 to λ ∈ (0, 0.7].
-        return float(min(0.7, 4.0 * (lower - 0.5)))
+        return float(min(0.7, 5.0 * (lower - self._GATE_FLOOR)))
 
     def score(self, x: np.ndarray) -> float:
         z = self._z(x)
@@ -149,27 +165,28 @@ class OnlineRanker:
         return (1.0 - lam) * h + lam * self._mlp(z)
 
     # ── learning ─────────────────────────────────────────────────────
-    def update_pair(self, x_pos: np.ndarray, x_neg: np.ndarray) -> float:
-        """One pairwise step: used ranked above ignored.
+    def referee_pair(self, x_pos: np.ndarray, x_neg: np.ndarray) -> None:
+        """Judge one HELD-OUT pair for the blend gate WITHOUT training on it.
 
-        Every EVAL_EVERY-th pair is HELD OUT — refereed for the blend gate but
-        NOT trained on (so the learner can never memorize it). The rest train
-        the live weights. Returns the pairwise loss (0.0 for held-out pairs)."""
+        The caller guarantees this pair (and the query it came from) is never
+        passed to :meth:`update_pair`, so the McNemar count is genuinely
+        out-of-sample — the learner cannot have memorized it, which is what
+        makes the gate immune to label noise."""
         self.events += 1
-        self._pair_count += 1
         zp, zn = self._z(x_pos), self._z(x_neg)
+        learner_ok = self._mlp(zp) > self._mlp(zn)
+        heur_ok = float(_HEURISTIC_W @ zp) > float(_HEURISTIC_W @ zn)
+        if learner_ok != heur_ok:
+            if learner_ok:
+                self.disc_b += 1
+            else:
+                self.disc_c += 1
 
-        if self._pair_count % self.EVAL_EVERY == 0:
-            # HELD-OUT: out-of-sample McNemar referee, no training.
-            learner_ok = self._mlp(zp) > self._mlp(zn)
-            heur_ok = float(_HEURISTIC_W @ zp) > float(_HEURISTIC_W @ zn)
-            if learner_ok != heur_ok:
-                if learner_ok:
-                    self.disc_b += 1
-                else:
-                    self.disc_c += 1
-            return 0.0
-
+    def update_pair(self, x_pos: np.ndarray, x_neg: np.ndarray) -> float:
+        """One pairwise SGD step: used ranked above ignored. TRAIN only — the
+        blend-gate referee is :meth:`referee_pair` on held-out queries."""
+        self.events += 1
+        zp, zn = self._z(x_pos), self._z(x_neg)
         # TRAIN: forward on live (non-EMA) weights.
         hp = self._gelu(zp @ self.W1 + self.b1)
         hn = self._gelu(zn @ self.W1 + self.b1)
@@ -220,7 +237,6 @@ class OnlineRanker:
             meta=json.dumps({
                 "n_norm": self.n_norm, "events": self.events,
                 "disc_b": self.disc_b, "disc_c": self.disc_c,
-                "pair_count": self._pair_count,
                 "lr": self.lr, "l2": self.l2, "blend_min_events": self.blend_min_events,
             }),
         )
@@ -239,7 +255,6 @@ class OnlineRanker:
         r.events = meta["events"]
         r.disc_b = int(meta.get("disc_b", 0))
         r.disc_c = int(meta.get("disc_c", 0))
-        r._pair_count = int(meta.get("pair_count", 0))
         return r
 
     def stats(self) -> Dict[str, float]:

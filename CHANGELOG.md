@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.2.1] — 2026-07-20
+
+Final gatekeeper review (three more adversarial passes: fix-correctness,
+integration/deadlock/E2E, plus hand-verification). Ship verdict was
+conditional on freezing these fixes — this is that freeze.
+
+### Fixed
+- **Blend gate was not actually out-of-sample** (the 1.2.0 fix's premise).
+  The held-out split was per-CALL-ordinal, and `_replay()` fed already-trained
+  pairs through the same counter — so "held-out" referee pairs were routinely
+  in-sample replays, letting recurring-pair label noise open the gate.
+  Rebuilt as a QUERY-LEVEL holdout: a deterministic ~25% of queries (by hash)
+  go only to `referee_pair()` (never trained, never buffered), the rest train.
+  Integer counts, Wilson z=3.0, and a 0.52 win-rate floor (absorbs residual
+  document overlap between held-out and trained queries). Verified: moderate
+  real signal → λ 0.70; pure noise → held-out win-rate 0.50, gate shut; even
+  engine-level noise with document overlap stays shut.
+- **distill left the in-memory embedder ahead of disk on a failed commit** —
+  `self.embedder.table` was swapped BEFORE the store transaction, so a
+  rollback left queries using the new table over old vectors. Now built on a
+  scratch embedder and adopted only after the commit succeeds. Plus an
+  `all_ids ⊆ stored-text` guard so a partial re-embed can't orphan nodes on
+  the old table.
+- **LINK symmetrization double-weighted reciprocated links** (A↔B counted
+  twice in the row-normalized adjacency, distorting `ppr_link`). Dedup by pair
+  (max weight).
+- **search() was non-idempotent and could explode** — `observe()` ran during
+  ranking (a candidate perturbed its own z-score) and a near-constant feature
+  drove `var → 0`, swinging absolute scores ~100× on small corpora. observe()
+  now runs AFTER ranking; z-scores are clipped to ±8 (contains the blow-up
+  without rescaling informative features — MIRACL-ko nDCG unchanged at 0.593).
+
+### Verified solid (adversarial, reproduced)
+- No deadlock (8-thread mixed ops), no crash, no data corruption; persistence
+  bit-exact for the learned ranker (mu/var/weights/counts) and edge tables;
+  remove() fully purges edges/caches/feedback tokens; every degenerate input
+  degrades gracefully.
+
 ## [1.2.0] — 2026-07-20
 
 Adversarial-review hardening. Three independent reviewers (correctness,

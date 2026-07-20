@@ -9,3 +9,4 @@ build/
 *.db-shm
 *.emb.npz
 .env
+uv.lock

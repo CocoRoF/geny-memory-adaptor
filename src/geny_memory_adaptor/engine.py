@@ -300,7 +300,11 @@ class SynapseMemory:
                 _KIND_PRIOR.get(node["kind"], 0.5),
                 min(1.0, node["text_len"] / 512.0),
             ], dtype=np.float32)
-            self.ranker.observe(x)
+            # NOTE: do NOT observe() here — updating the normalization stats
+            # mid-ranking makes a candidate perturb its own (and later
+            # candidates') z-scores, so search is non-idempotent. Score against
+            # the current stats, collect the features, and fold them into the
+            # running normalization AFTER ranking (below).
             feats[nid] = x
             score = self.ranker.score(x)
             sources = []
@@ -316,6 +320,11 @@ class SynapseMemory:
                                     sources=sources))
         scored.sort(key=lambda h: -h.score)
         result = scored[:top_k]
+
+        # Fold this query's candidate features into the running normalization
+        # AFTER ranking — so the scores above are idempotent w.r.t. this call.
+        for x in feats.values():
+            self.ranker.observe(x)
 
         # ε-exploration: swap the tail slot with a random non-shown candidate.
         if (len(scored) > top_k and result and
@@ -367,20 +376,28 @@ class SynapseMemory:
                                decay=self.cfg.hebb_decay, prune=self.cfg.hebb_prune)
             self._adj_cache.pop(EDGE_COACCESS, None)
 
-        # ② Ranker: event pairs + replay refresh.
+        # ② Ranker. Split by QUERY: a deterministic ~25% of queries are HELD
+        # OUT — refereed for the blend gate, never trained on (and never added
+        # to the replay buffer), so the gate's McNemar test is truly
+        # out-of-sample. The rest train the live weights + feed replay.
+        is_eval = (int(q["hash"], 16) % 4 == 0)
         loss = 0.0
         pairs = 0
         for u in used:
             for g in ignored:
-                loss += self.ranker.update_pair(q["features"][u], q["features"][g])
-                pairs += 1
-        for nid in used:
-            self.store.add_feedback(q["hash"], nid, q["features"][nid].tobytes(),
-                                    True, label_src, self.cfg.replay_cap)
-        for nid in ignored:
-            self.store.add_feedback(q["hash"], nid, q["features"][nid].tobytes(),
-                                    False, label_src, self.cfg.replay_cap)
-        pairs += self._replay(8)
+                if is_eval:
+                    self.ranker.referee_pair(q["features"][u], q["features"][g])
+                else:
+                    loss += self.ranker.update_pair(q["features"][u], q["features"][g])
+                    pairs += 1
+        if not is_eval:
+            for nid in used:
+                self.store.add_feedback(q["hash"], nid, q["features"][nid].tobytes(),
+                                        True, label_src, self.cfg.replay_cap)
+            for nid in ignored:
+                self.store.add_feedback(q["hash"], nid, q["features"][nid].tobytes(),
+                                        False, label_src, self.cfg.replay_cap)
+            pairs += self._replay(8)
         self._persist_ranker()  # ranker only — the embedder is untouched here
         return {"applied": 1.0, "pairs": float(pairs),
                 "loss": loss / max(1, pairs), **self.ranker.stats()}
@@ -420,15 +437,28 @@ class SynapseMemory:
                 lr=self.cfg.distill_lr, batch=self.cfg.distill_batch)
             candidate = metrics.pop("candidate", None)
             if candidate is not None:
-                # Apply on a scratch embedder, re-embed EVERY node with it, then
-                # commit the table + all vectors in ONE transaction. A crash
-                # rolls back both together — the stored table and its vectors
-                # can never disagree.
-                self.embedder.table = candidate
+                # Re-embedding must cover EVERY node, else the un-covered ones
+                # keep OLD-table vectors that the NEW query embedder can't match.
+                all_ids = {n["id"] for n in self.store.nodes()}
+                if not all_ids.issubset(texts.keys()):
+                    metrics["swapped"] = 0.0
+                    metrics["reason_incomplete_text"] = 1.0
+                    self._persist_ranker()
+                    return metrics
+                # Build the candidate on a SCRATCH embedder and swap it in ONLY
+                # after the store commit succeeds. If the commit rolls back, the
+                # live embedder + on-disk table + vectors all stay OLD together —
+                # no in-memory/disk mismatch for the rest of the session.
+                scratch = HashEmbedder(
+                    self.cfg.vocab_size, self.cfg.dim, seed=self.cfg.seed,
+                    char_ngrams=self.cfg.char_ngrams, jamo_ngrams=self.cfg.jamo_ngrams,
+                    suffix_strip=self.cfg.suffix_strip)
+                scratch.table = candidate
                 rows = [(nid, self.cfg.dim,
-                         pack_vec(self.embedder.embed(txt, limit=self.cfg.max_doc_tokens)))
+                         pack_vec(scratch.embed(txt, limit=self.cfg.max_doc_tokens)))
                         for nid, txt in texts.items()]
-                self.store.swap_embedder_and_vectors(self.embedder.dumps(), rows)
+                self.store.swap_embedder_and_vectors(scratch.dumps(), rows)
+                self.embedder = scratch  # commit succeeded → adopt atomically
                 self._vec_cache = None
                 self._vec_matrix = None
             self._persist_ranker()

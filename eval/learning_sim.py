@@ -38,8 +38,12 @@ def build_ambiguous(mem: SynapseMemory, n: int = 10) -> None:
                   tags=["법률", "판례"])
 
 
+# Varied query phrasings so the query-level holdout actually splits ~25% out.
+_QUERIES = [f"판정 기록 정리 {w}" for w in "가나다라마바사아자차카타파하거너더러머버서"]
+
+
 def game_ranks(mem) -> float:
-    hits = mem.search("판정 기록 정리", top_k=20)
+    hits = mem.search(_QUERIES[0], top_k=20)
     rs = [i for i, h in enumerate(hits) if h.id.startswith("game")]
     return sum(rs) / len(rs) if rs else 99.0
 
@@ -50,8 +54,8 @@ def scenario_genuine() -> None:
     build_ambiguous(mem)
     before = game_ranks(mem)
     opened = None
-    for step in range(1, 301):
-        hits = mem.search("판정 기록 정리", top_k=20)
+    for step in range(1, 601):
+        hits = mem.search(_QUERIES[step % len(_QUERIES)], top_k=20)
         used = [h.id for h in hits if h.id.startswith("game")][:3]
         if used:
             r = mem.feedback(hits[0].query_token, used_ids=used)
@@ -73,8 +77,8 @@ def scenario_noise() -> None:
     mem = SynapseMemory(SynapseConfig(path=":memory:", epsilon=0.0, blend_min_events=40))
     build_ambiguous(mem)
     rng = random.Random(0)
-    for _ in range(400):
-        hits = mem.search("판정 기록 정리", top_k=20)
+    for step in range(800):
+        hits = mem.search(_QUERIES[step % len(_QUERIES)], top_k=20)
         if len(hits) >= 2:
             mem.feedback(hits[0].query_token, used_ids=[h.id for h in rng.sample(hits, 2)])
     st = mem.stats()["ranker"]
@@ -115,8 +119,8 @@ def scenario_persistence() -> None:
         db = str(Path(td) / "s.db")
         m1 = SynapseMemory(SynapseConfig(path=db, epsilon=0.0, blend_min_events=30))
         build_ambiguous(m1)
-        for _ in range(120):
-            h = m1.search("판정 기록 정리", top_k=20)
+        for step in range(240):
+            h = m1.search(_QUERIES[step % len(_QUERIES)], top_k=20)
             u = [x.id for x in h if x.id.startswith("game")][:3]
             if u:
                 m1.feedback(h[0].query_token, used_ids=u)

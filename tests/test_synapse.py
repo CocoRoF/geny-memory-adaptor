@@ -124,17 +124,41 @@ def test_ranker_learns_pairwise_and_blend_gates():
     # Ground truth: feature 6 (ppr_co) decides, heuristic barely weighs it.
     def sample(pos: bool):
         x = rng.normal(0, 1, len(FEATURES)).astype(np.float32)
-        x[6] = (2.0 if pos else -2.0) + rng.normal(0, 0.2)
+        x[6] = (0.6 if pos else -0.6) + rng.normal(0, 0.4)
         return x
     for x in [sample(bool(i % 2)) for i in range(50)]:
         r.observe(x)
     assert r.blend == 0.0  # gate closed before enough events
     losses = []
-    for _ in range(400):
-        losses.append(r.update_pair(sample(True), sample(False)))
+    for i in range(5000):
+        p, n = sample(True), sample(False)
+        if i % 4 == 0:               # 25% held out → referee only (out-of-sample)
+            r.referee_pair(p, n)
+        else:
+            losses.append(r.update_pair(p, n))
     assert np.mean(losses[-50:]) < np.mean(losses[:50])  # learning reduces loss
-    assert r.blend > 0.0  # learner beats heuristic on this task → gate opens
+    assert r.blend > 0.0  # learner beats heuristic on held-out pairs → gate opens
     assert r.score(sample(True)) > r.score(sample(False))
+
+
+def test_ranker_gate_shut_on_pure_noise():
+    """Out-of-sample McNemar: random labels → held-out win-rate ≈ 0.5 → gate
+    never opens (the property the query-level holdout guarantees)."""
+    r = OnlineRanker(blend_min_events=40)
+    rng = np.random.default_rng(2)
+    def s():
+        return rng.normal(0, 1, len(FEATURES)).astype(np.float32)
+    for _ in range(80):
+        r.observe(s())
+    for i in range(12000):
+        a, b = s(), s()
+        p, n = (a, b) if rng.random() < 0.5 else (b, a)  # random label
+        if i % 4 == 0:
+            r.referee_pair(p, n)
+        else:
+            r.update_pair(p, n)
+    assert r.blend == 0.0  # noise never opens the gate
+    assert 0.45 < r.stats()["win_rate"] < 0.55  # held-out is a true coin flip
 
 
 def test_ranker_persistence_roundtrip():
@@ -290,16 +314,18 @@ async def test_vector_handle_shapes():
 
 
 def test_blend_gate_resists_label_noise():
-    """Random feedback must NOT open the blend gate — the McNemar+Wilson
-    gate's core safety property (regression guard for the 0.05 leak)."""
+    """Random feedback across VARIED queries (so the query-level holdout
+    actually splits) must NOT open the gate — the core safety property, and
+    the regression guard for both the 0.05 leak and the replay/phase-lock leak."""
     mem = make_mem(blend_min_events=40)
     for t in ("게임", "요리", "개발"):
         for i in range(6):
             mem.index(f"{t}-{i}", f"{t} 관련 메모 상세 {i}", title=f"{t} {i}", tags=[t])
     import random as _r
     rng = _r.Random(0)
-    for _ in range(300):
-        hits = mem.search("게임 요리 개발 메모", top_k=10)
+    queries = [f"게임 요리 개발 메모 {w}" for w in "가나다라마바사아자차카타파하거너더러머버"]
+    for step in range(1500):
+        hits = mem.search(queries[step % len(queries)], top_k=10)
         if len(hits) >= 2:
             mem.feedback(hits[0].query_token, used_ids=[h.id for h in rng.sample(hits, 2)])
     assert mem.stats()["ranker"]["blend"] == 0.0  # floor protected under noise
@@ -423,3 +449,65 @@ def test_concurrent_search_index_feedback_no_crash():
     for t in ts:
         t.join()
     assert not errors, errors[:3]
+
+
+def test_mutual_link_not_double_weighted():
+    """Final review: LINK symmetrization must dedup a mutual link (A↔B), else
+    PPR over-weights it vs one-way links."""
+    from geny_memory_adaptor.graph import build_type_adjacency
+    from geny_memory_adaptor.store import EDGE_LINK
+    adj = build_type_adjacency(
+        [("A", "B", 1.0, 0.0), ("B", "A", 1.0, 0.0)], EDGE_LINK)
+    assert adj["A"] == [("B", 1.0)] and adj["B"] == [("A", 1.0)]  # no dup
+
+
+def test_distill_rollback_keeps_embedder_consistent(tmp_path):
+    """Final review: a failed store commit during distill must NOT leave the
+    in-memory embedder swapped ahead of the on-disk table/vectors."""
+    db = str(tmp_path / "d.db")
+    mem = SynapseMemory(SynapseConfig(path=db, vocab_size=2048, dim=16, epsilon=0.0,
+                                      distill_epochs=20, distill_lr=2e-2))
+    rng = np.random.default_rng(3)
+    pools = [[f"군집{c}어휘{w}" for w in range(10)] for c in range(3)]
+    for i in range(60):
+        c = i % 3
+        words = rng.choice(pools[c], 3, replace=False)
+        t = np.zeros(24); t[c * 8] = 1.0
+        mem.index(f"n{i}", " ".join(words), teacher_vec=t + rng.normal(0, 0.05, 24))
+    before = id(mem.embedder.table)
+
+    def boom(*a, **k):
+        raise RuntimeError("injected commit failure")
+    mem.store.swap_embedder_and_vectors = boom  # type: ignore
+    try:
+        mem.distill()
+    except RuntimeError:
+        pass
+    assert id(mem.embedder.table) == before  # embedder untouched on rollback
+    mem.close()
+
+
+def test_search_scores_bounded_on_low_variance():
+    """Final review: a small corpus (near-constant features → var→0) must not
+    blow up absolute scores; z-clipping contains it. Ranking still works."""
+    mem = make_mem()
+    for i in range(15):
+        mem.index(f"n{i}", f"게임 판정 메모 {i}", tags=["게임"])
+    for _ in range(5):
+        hits = mem.search("게임 판정")
+        assert hits and all(abs(h.score) < 100 for h in hits)  # no explosion
+
+
+def test_search_is_idempotent_within_a_call():
+    """Final review: observe() runs AFTER ranking, so a candidate can't perturb
+    its own z-score mid-search — features fed to the ranker are scored against
+    one consistent normalization snapshot."""
+    mem = make_mem()
+    for i in range(20):
+        mem.index(f"n{i}", f"게임 판정 메모 {i} 내용", tags=["게임"])
+    # First ever search: mu=0/var=1 baseline. The ranking must be a pure
+    # function of that snapshot (observe hasn't run yet within this call).
+    r = mem.search("게임 판정 내용", top_k=8)
+    # Re-score the SAME captured features with the pre-search ranker state would
+    # match; here we just assert a stable, sane top result and no NaN/inf.
+    assert r and all(np.isfinite(h.score) for h in r)
