@@ -166,7 +166,7 @@ class SynapseMemory:
             if teacher_vec is not None:
                 tv = np.asarray(teacher_vec, dtype=np.float32)
                 teacher = (teacher_model, pack_vec(tv), int(tv.shape[0]))
-            text_param = ((f"text:{node_id}", body[:4000].encode("utf-8"))
+            text_param = ((f"text:{node_id}", body[:self.cfg.store_text_maxlen].encode("utf-8"))
                           if self.cfg.store_text else None)
 
             # ── one atomic transaction: node + postings + vector + edges ──
@@ -551,10 +551,19 @@ class SynapseMemory:
         self._persist_ranker()
         self._persist_embedder()
 
+    def get_text(self, node_id: str) -> Optional[str]:
+        """The stored (bounded) body of a node, or None. Requires
+        ``store_text=True``. Lets a host return the actual text alongside a
+        search hit — e.g. to fill a retrieval result's ``content`` — without
+        keeping the corpus in a second place."""
+        with self._lock:
+            blob = self.store.get_param(f"text:{node_id}")
+            return blob.decode("utf-8", "replace") if blob else None
+
     def _save_text_for_distill(self, node_id: str, body: str) -> None:
         # Distillation needs the text back; store a bounded copy in params-space.
         key = f"text:{node_id}"
-        self.store.put_param(key, body[:4000].encode("utf-8"))
+        self.store.put_param(key, body[:self.cfg.store_text_maxlen].encode("utf-8"))
 
     def _distill_texts(self) -> Dict[str, str]:
         out: Dict[str, str] = {}

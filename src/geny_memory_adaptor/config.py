@@ -58,9 +58,14 @@ class SynapseConfig:
     #: sidecar file to fall out of sync, and two instances can't clobber it.
     path: str = "synapse.db"
     #: Keep a copy of each note's text (bounded) so ``distill()`` can re-embed
-    #: the whole corpus with an improved table. Cleaned up on ``remove()``.
-    #: Set False when you never distill — then zero note text is duplicated.
+    #: the whole corpus with an improved table, and so a host can read a hit's
+    #: text back via ``get_text()``. Cleaned up on ``remove()``. Set False when
+    #: you never distill and never need the text back.
     store_text: bool = True
+    #: Max characters of each body kept when ``store_text`` — cap on the text
+    #: duplicated into the db. Raise it when using ``get_text()`` to surface
+    #: full note bodies in search results.
+    store_text_maxlen: int = 4000
 
     # ── embedding layer ──
     #: Hash-bucket vocabulary size (power of two).

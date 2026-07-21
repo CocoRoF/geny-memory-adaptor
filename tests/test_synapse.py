@@ -576,3 +576,18 @@ def test_knn_sample_cap_keeps_indexing_bounded():
     # still produces knn edges (from the capped sample)
     from geny_memory_adaptor.store import EDGE_KNN
     assert len(mem.store.edges_by_type(EDGE_KNN)) > 0
+
+
+def test_get_text_roundtrip_and_maxlen():
+    """Integration support: get_text() returns the stored body (bounded), and
+    store_text_maxlen caps it. Cleared on remove."""
+    mem = make_mem(store_text_maxlen=20)
+    mem.index("n1", "가나다라마바사아자차카타파하거너더러머버서어저처", title="제목")
+    t = mem.get_text("n1")
+    assert t is not None and len(t) <= 20 + len("제목\n")  # title\nbody, capped
+    mem.remove("n1")
+    assert mem.get_text("n1") is None
+    # store_text=False → no text kept
+    m2 = make_mem(store_text=False)
+    m2.index("x", "본문")
+    assert m2.get_text("x") is None

@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.3.0] — 2026-07-21
+
+Integration support for hosts (e.g. geny-executor's file memory provider).
+
+### Added
+- `SynapseMemory.get_text(node_id)` — returns a node's stored (bounded) body,
+  so a host can fill a search result's `content` from the same store without
+  keeping the corpus in a second place. Requires `store_text=True`.
+- `store_text_maxlen` config (default 4000) — cap on the per-note text kept in
+  the db; raise it when using `get_text()` to surface full note bodies.
+
 ## [1.2.2] — 2026-07-20
 
 High-difficulty stress hardening. Three more executed adversarial passes —
