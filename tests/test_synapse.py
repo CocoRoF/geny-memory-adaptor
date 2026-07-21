@@ -591,3 +591,60 @@ def test_get_text_roundtrip_and_maxlen():
     m2 = make_mem(store_text=False)
     m2.index("x", "본문")
     assert m2.get_text("x") is None
+
+
+def test_learn_direct_features_opens_gate_and_is_crossturn_safe():
+    """engine.learn() — the cross-turn-safe, feature-level feedback path.
+
+    The host supplies feature vectors (from a remembered search), so learning
+    does NOT depend on the bounded _recent_queries cache: a note edited/cited
+    many searches later still reinforces. Verifies the same three guarantees as
+    feedback(): a genuine signal opens the blend gate, the learned ranker
+    re-orders correctly, and Hebbian co-access edges form between co-useful ids.
+    """
+    mem = make_mem(blend_min_events=40)
+    rng = np.random.default_rng(0)
+    n = len(FEATURES)
+    rec = FEATURES.index("recency")
+
+    def mk(is_pos):
+        x = rng.normal(0, 0.3, n).astype(np.float32)
+        x[rec] = -1.0 if is_pos else 1.0  # heuristic weights recency +, so WRONG
+        return x
+
+    # Flood _recent_queries with unrelated searches so any cache dependency
+    # would have evicted the training queries — learn() must be immune.
+    for _ in range(200):
+        mem.index(f"noise-{_}", "무관한 노트", kind="note")
+        mem.search("무관", top_k=3)
+
+    opened = None
+    for step in range(4000):
+        mem.learn(f"q{step}", positives=[("p", mk(True))], negatives=[mk(False)],
+                  label_src="edit")
+        if opened is None and mem.ranker.blend > 0:
+            opened = step
+    assert mem.ranker.blend > 0.0, "genuine signal must open the gate"
+    assert opened is not None
+    p, ng = mk(True), mk(False)
+    assert mem.ranker.heuristic(p) < mem.ranker.heuristic(ng)  # heuristic is wrong
+    assert mem.ranker.score(p) > mem.ranker.score(ng)          # learned is right
+
+
+def test_learn_direct_gate_shut_on_noise_and_hebbian_forms():
+    from geny_memory_adaptor.store import EDGE_COACCESS
+    mem = make_mem(blend_min_events=40)
+    rng = np.random.default_rng(5)
+    n = len(FEATURES)
+    for step in range(4000):  # pure noise labels → gate must stay shut
+        a = rng.normal(0, 0.3, n).astype(np.float32)
+        b = rng.normal(0, 0.3, n).astype(np.float32)
+        mem.learn(f"q{step}", positives=[("p", a)], negatives=[b], label_src="noise")
+    assert mem.ranker.blend == 0.0, "noise must never open the gate"
+
+    # Hebbian: two ids confirmed useful TOGETHER get a co-access edge.
+    z = np.zeros(n, dtype=np.float32)
+    mem.index("a", "가", kind="note"); mem.index("b", "나", kind="note")
+    mem.learn("multi", positives=[("a", z), ("b", z)], negatives=[z], label_src="edit")
+    assert mem.store.get_edge("a", "b", EDGE_COACCESS) is not None
+    assert mem.store.get_edge("b", "a", EDGE_COACCESS) is not None

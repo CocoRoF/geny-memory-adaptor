@@ -419,6 +419,79 @@ class SynapseMemory:
             done += 1
         return done
 
+    def learn(self, query_key: str, *,
+              positives: Sequence[tuple], negatives: Sequence[Sequence[float]],
+              label_src: str = "implicit") -> Dict[str, float]:
+        """Feature-level feedback — the CROSS-TURN-SAFE learning entry point.
+
+        Unlike :meth:`feedback` (which looks the query's candidate features up
+        in the bounded ``_recent_queries`` cache and so silently no-ops once the
+        query has been evicted), ``learn`` takes the feature vectors from the
+        caller. A host that remembers "note X was shown for query Q with feature
+        vector f" can therefore reinforce it any number of turns later — when the
+        user finally *edits* or *cites* that note — with no dependency on how
+        many searches happened in between.
+
+        Parameters
+        ----------
+        query_key : str
+            A stable identifier for the originating query. Only its hash is used,
+            to place the whole query on the SAME side of the blend gate's
+            out-of-sample hold-out (so a query is either trained-on or refereed,
+            never both — the property that makes the gate immune to label noise).
+        positives : sequence of ``(node_id, feature_vector)``
+            The memories a trusted external signal says were actually useful.
+            ``node_id`` drives Hebbian co-access (ids that were useful *together*
+            get linked); the feature vector drives the pairwise ranker.
+        negatives : sequence of feature_vector
+            Features of memories shown for the same query but NOT flagged useful
+            (the ranker learns useful > shown-but-unused). Caller must never pass
+            "every result" as positive — that would train the ranker to rubber-
+            stamp whatever the current retriever already surfaces.
+        """
+        with self._lock:
+            return self._learn(query_key, positives, negatives, label_src)
+
+    def _learn(self, query_key: str, positives: Sequence[tuple],
+               negatives: Sequence[Sequence[float]], label_src: str) -> Dict[str, float]:
+        pos = [(pid, np.asarray(f, dtype=np.float32)) for pid, f in positives
+               if f is not None]
+        neg = [np.asarray(f, dtype=np.float32) for f in negatives if f is not None]
+        if not pos or not neg:
+            return {"applied": 0.0, "pairs": 0.0}
+        qh = hashlib.sha1(query_key.encode("utf-8")).hexdigest()[:16]
+
+        # ① Hebbian — memories confirmed useful TOGETHER get a co-access edge.
+        pos_ids = [pid for pid, _ in pos if pid]
+        if len(pos_ids) >= 2:
+            reinforce_coaccess(self.store, pos_ids, eta=self.cfg.hebb_eta,
+                               decay=self.cfg.hebb_decay, prune=self.cfg.hebb_prune)
+            self._adj_cache.pop(EDGE_COACCESS, None)
+
+        # ② Ranker — same query-level hold-out split as feedback(): a
+        # deterministic ~25% of queries referee the blend gate (never trained).
+        is_eval = (int(qh, 16) % 4 == 0)
+        loss = 0.0
+        pairs = 0
+        for _, pf in pos:
+            for nf in neg:
+                if is_eval:
+                    self.ranker.referee_pair(pf, nf)
+                else:
+                    loss += self.ranker.update_pair(pf, nf)
+                    pairs += 1
+        if not is_eval:
+            for pid, pf in pos:
+                self.store.add_feedback(qh, pid or "pos", pf.tobytes(), True,
+                                        label_src, self.cfg.replay_cap)
+            for i, nf in enumerate(neg):
+                self.store.add_feedback(qh, f"neg{i}", nf.tobytes(), False,
+                                        label_src, self.cfg.replay_cap)
+            pairs += self._replay(8)
+        self._persist_ranker()
+        return {"applied": 1.0, "pairs": float(pairs),
+                "loss": loss / max(1, pairs), **self.ranker.stats()}
+
     # ── distillation ────────────────────────────────────────────────
     def distill(self, *, epochs: Optional[int] = None) -> Dict[str, Any]:
         """Fit the embedding table to stored teacher vectors, then ATOMICALLY
