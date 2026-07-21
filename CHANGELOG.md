@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.4.0] — 2026-07-21
+
+Closes the learning loop for hosts that have no per-turn feedback seam.
+
+### Added
+- `SynapseMemory.learn(query_key, positives, negatives)` — cross-turn-safe,
+  feature-level feedback. `feedback()` looks candidate features up in the
+  bounded `_recent_queries` cache and silently no-ops once a query is evicted,
+  which is fatal for signals that only arrive turns later (a note edited/cited
+  well after it was retrieved). `learn()` takes the feature vectors from the
+  caller instead, so a host that remembered "note X was shown for query Q with
+  features f" can reinforce it any number of turns later. Same guarantees as
+  `feedback()`: query-level out-of-sample hold-out McNemar blend gate (genuine
+  signal opens λ, pure-noise labels never do), pairwise-logistic ranker SGD +
+  replay, and Hebbian co-access between ids confirmed useful together. Callers
+  must never pass every result as positive — negatives are the same query's
+  shown-but-unflagged items. (2 new tests; 64 green.)
+
 ## [1.3.0] — 2026-07-21
 
 Integration support for hosts (e.g. geny-executor's file memory provider).
