@@ -61,7 +61,22 @@ class Store:
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Idempotent column additions for DBs created by older versions.
+        ADD COLUMN with a constant default is O(1) in SQLite — safe on live
+        vaults. trust: per-item reliability prior in [0,1], neutral 0.5;
+        trust_updated: timestamp of the last trust write (drives the lazy
+        decay-to-neutral that stops stale reinforcement from ossifying)."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(nodes)")}
+        if "trust" not in cols:
+            self._conn.execute(
+                "ALTER TABLE nodes ADD COLUMN trust REAL DEFAULT 0.5")
+        if "trust_updated" not in cols:
+            self._conn.execute(
+                "ALTER TABLE nodes ADD COLUMN trust_updated REAL DEFAULT 0")
 
     # ── transactional write helper ───────────────────────────────────
     def _write(self, fn) -> Any:
@@ -137,25 +152,24 @@ class Store:
                 c.execute("INSERT OR REPLACE INTO params(key,blob) VALUES(?,?)", (key, blob))
         self._write(_do)
 
+    _NODE_COLS = ("id,kind,title,tags,text_len,updated_at,access_count,last_access,"
+                  "pinned,importance,trust,trust_updated")
+
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         rows = self._read(
-            "SELECT id,kind,title,tags,text_len,updated_at,access_count,last_access,"
-            "pinned,importance FROM nodes WHERE id=?", (node_id,))
+            f"SELECT {self._NODE_COLS} FROM nodes WHERE id=?", (node_id,))
         return self._node_row(rows[0]) if rows else None
 
     def nodes(self, ids: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
         if ids is None:
-            rows = self._read(
-                "SELECT id,kind,title,tags,text_len,updated_at,access_count,last_access,"
-                "pinned,importance FROM nodes")
+            rows = self._read(f"SELECT {self._NODE_COLS} FROM nodes")
             return [self._node_row(r) for r in rows]
         ids = list(ids)
         if not ids:
             return []
         q = ",".join("?" for _ in ids)
         rows = self._read(
-            f"SELECT id,kind,title,tags,text_len,updated_at,access_count,last_access,"
-            f"pinned,importance FROM nodes WHERE id IN ({q})", ids)
+            f"SELECT {self._NODE_COLS} FROM nodes WHERE id IN ({q})", ids)
         return [self._node_row(r) for r in rows]
 
     @staticmethod
@@ -164,7 +178,14 @@ class Store:
             "id": r[0], "kind": r[1], "title": r[2], "tags": json.loads(r[3] or "[]"),
             "text_len": r[4], "updated_at": r[5], "access_count": r[6],
             "last_access": r[7], "pinned": bool(r[8]), "importance": r[9],
+            "trust": 0.5 if r[10] is None else float(r[10]),
+            "trust_updated": float(r[11] or 0.0),
         }
+
+    def set_trust(self, node_id: str, trust: float, ts: float) -> None:
+        self._write(lambda c: c.execute(
+            "UPDATE nodes SET trust=?, trust_updated=? WHERE id=?",
+            (trust, ts, node_id)))
 
     def remove_node(self, node_id: str) -> None:
         def _do(c):

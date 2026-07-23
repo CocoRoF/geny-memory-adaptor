@@ -307,6 +307,12 @@ class SynapseMemory:
             # running normalization AFTER ranking (below).
             feats[nid] = x
             score = self.ranker.score(x)
+            # Per-item trust prior — additive, so negatively-scored candidates
+            # are pushed the same direction as positive ones (a multiplier
+            # would invert the effect below zero). Neutral trust (0.5) adds 0.
+            if self.cfg.trust_weight > 0:
+                score += (self._effective_trust(node, now) - 0.5) * 2.0 \
+                    * self.cfg.trust_weight
             sources = []
             if nid in bm25:
                 sources.append("bm25")
@@ -375,6 +381,9 @@ class SynapseMemory:
             reinforce_coaccess(self.store, used, eta=self.cfg.hebb_eta,
                                decay=self.cfg.hebb_decay, prune=self.cfg.hebb_prune)
             self._adj_cache.pop(EDGE_COACCESS, None)
+        # ①b Trust — same policy as learn(): used items gain reliability.
+        for nid in used:
+            self.trust_feedback(nid, True)
 
         # ② Ranker. Split by QUERY: a deterministic ~25% of queries are HELD
         # OUT — refereed for the blend gate, never trained on (and never added
@@ -418,6 +427,41 @@ class SynapseMemory:
             self.ranker.update_pair(self._rng.choice(d["p"]), self._rng.choice(d["n"]))
             done += 1
         return done
+
+    # ── per-item trust (reliability prior) ──────────────────────────
+    def _effective_trust(self, node: Dict[str, Any], now: float) -> float:
+        """Trust with lazy decay TOWARD NEUTRAL (0.5).
+
+        The anti-ossification mechanism: a reinforcement that is never
+        re-confirmed fades back to neutral instead of hardening into a
+        permanent belief the engine cites against itself long after the
+        world changed. Pure read — nothing is written here."""
+        t = float(node.get("trust", 0.5))
+        hl = self.cfg.trust_half_life_days
+        if hl <= 0 or t == 0.5:
+            return t
+        ts = float(node.get("trust_updated") or 0.0)
+        if ts <= 0:
+            return t
+        age_days = max(0.0, (now - ts) / 86400.0)
+        return 0.5 + (t - 0.5) * (0.5 ** (age_days / hl))
+
+    def trust_feedback(self, node_id: str, helpful: bool, *,
+                       now: Optional[float] = None) -> Optional[float]:
+        """Explicit per-item reliability feedback, asymmetric (loss-averse):
+        helpful +trust_helpful, unhelpful −trust_unhelpful (2× by default).
+        The stored value is decayed to *now* first, so stale trust doesn't
+        anchor the update. Returns the new trust, or None if unknown id."""
+        with self._lock:
+            node = self.store.get_node(node_id)
+            if node is None:
+                return None
+            ts = now if now is not None else time.time()
+            eff = self._effective_trust(node, ts)
+            delta = self.cfg.trust_helpful if helpful else -self.cfg.trust_unhelpful
+            t = min(1.0, max(0.0, eff + delta))
+            self.store.set_trust(node_id, t, ts)
+            return t
 
     def learn(self, query_key: str, *,
               positives: Sequence[tuple], negatives: Sequence[Sequence[float]],
@@ -467,6 +511,12 @@ class SynapseMemory:
             reinforce_coaccess(self.store, pos_ids, eta=self.cfg.hebb_eta,
                                decay=self.cfg.hebb_decay, prune=self.cfg.hebb_prune)
             self._adj_cache.pop(EDGE_COACCESS, None)
+        # ①b Trust — a confirmed-useful item gains reliability. (Negatives do
+        # NOT lose trust here: shown-but-unflagged is a ranking contrast, not
+        # evidence the memory itself is wrong — explicit unhelpful feedback
+        # goes through trust_feedback().)
+        for pid in pos_ids:
+            self.trust_feedback(pid, True)
 
         # ② Ranker — same query-level hold-out split as feedback(): a
         # deterministic ~25% of queries referee the blend gate (never trained).
@@ -491,6 +541,169 @@ class SynapseMemory:
         self._persist_ranker()
         return {"applied": 1.0, "pairs": float(pairs),
                 "loss": loss / max(1, pairs), **self.ranker.stats()}
+
+    # ── compositional entity join (AND/OR retrieval) ─────────────────
+    def search_join(self, entities: Sequence[str], *, mode: str = "and",
+                    top_k: Optional[int] = None) -> List[SearchHit]:
+        """Memories related to ALL (*and*) or ANY (*or*) of *entities*.
+
+        Additive fusion (plain BM25 over "e1 e2") lets one strong single-
+        entity match dominate; the intersection question — "what touches
+        BOTH X and Y?" — needs the WEAKEST-LINK score. Per entity we build a
+        relatedness map (normalized BM25 ∪ graph PPR from that entity's
+        lexical seeds, so a memory can qualify through a LINK/TAG/KNN
+        connection even without mentioning the entity verbatim), then score
+        candidates by ``min`` across entities (AND) or ``mean`` (OR)."""
+        if mode not in ("and", "or"):
+            raise ValueError(f"mode must be 'and' or 'or', got {mode!r}")
+        with self._lock:
+            top_k = self.cfg.top_k if top_k is None else max(0, top_k)
+            ents = [e for e in entities if e and e.strip()]
+            if not ents:
+                return []
+            rels: List[Dict[str, float]] = []
+            for ent in ents:
+                toks = lexical_tokens(ent, char_ngrams=self.cfg.char_ngrams,
+                                      suffix_strip=self.cfg.suffix_strip,
+                                      cross_space=self.cfg.cross_space,
+                                      limit=self.cfg.max_query_tokens)
+                bm = bm25_scores(self.store, toks, doc_lens=self._doclens(),
+                                 k1=self.cfg.bm25_k1, b=self.cfg.bm25_b)
+                rel: Dict[str, float] = {}
+                if bm:
+                    mx = max(bm.values())
+                    if mx > 0:
+                        for n, s in bm.items():
+                            rel[n] = s / mx
+                # graph reach: PPR seeded by the entity's lexical top hits —
+                # slightly discounted so verbatim mentions outrank hops.
+                seeds = {n: bm[n] for n in top_n(bm, self.cfg.bm25_seed_k)}
+                if seeds:
+                    ppr = ppr_features(self._adjacencies(), seeds,
+                                       alpha=self.cfg.ppr_alpha,
+                                       iters=self.cfg.ppr_iters)
+                    flat: Dict[str, float] = {}
+                    for etype_scores in ppr.values():
+                        for n, s in etype_scores.items():
+                            if s > flat.get(n, 0.0):
+                                flat[n] = s
+                    if flat:
+                        pmx = max(flat.values())
+                        if pmx > 0:
+                            for n, s in flat.items():
+                                cand = 0.8 * s / pmx
+                                if cand > rel.get(n, 0.0):
+                                    rel[n] = cand
+                rels.append(rel)
+
+            if mode == "and":
+                common = set(rels[0])
+                for r in rels[1:]:
+                    common &= set(r)
+                scored = [(n, min(r[n] for r in rels)) for n in common]
+            else:
+                every = set().union(*rels)
+                scored = [(n, sum(r.get(n, 0.0) for r in rels) / len(rels))
+                          for n in every]
+            scored.sort(key=lambda t: -t[1])
+            picked = scored[:top_k]
+            meta = {m["id"]: m for m in self.store.nodes([n for n, _ in picked])}
+            out: List[SearchHit] = []
+            for nid, s in picked:
+                node = meta.get(nid) or {}
+                out.append(SearchHit(
+                    id=nid, score=float(s), title=node.get("title", ""),
+                    kind=node.get("kind", "note"),
+                    features={}, sources=[f"join:{mode}"]))
+            return out
+
+    # ── contradiction detection (store hygiene) ─────────────────────
+    #: Deterministic negation markers (ko + en). Bag-of-ngram similarity is
+    #: nearly blind to negation ("작동한다" vs "작동하지 않는다" score as
+    #: highly similar), so marker ASYMMETRY is the primary divergence signal
+    #: for true contradictions; (1 − cosine) alone only catches topic drift.
+    _NEG_MARKERS = (
+        "않", "안 ", "안된", "안 된", "안됨", "못 ", "못한", "못함", "없",
+        "아니", "불가", "금지", "말 것", "실패",
+        "not ", "no ", "never", "don't", "doesn't", "can't", "cannot",
+        "won't", "broken", "fails", "failed", "disabled", "unavailable",
+    )
+
+    @classmethod
+    def _has_negation(cls, text: str) -> bool:
+        low = text.lower()
+        return any(m in low for m in cls._NEG_MARKERS)
+
+    def contradictions(self, node_id: str, *, top_k: int = 5,
+                       min_score: float = 0.15,
+                       candidates: int = 64) -> List[Dict[str, Any]]:
+        """Memories that likely CONFLICT with *node_id* — store hygiene.
+
+        score = word_jaccard × divergence, where divergence = (1 − cosine)
+        plus a +0.5 boost when exactly one side carries a negation marker.
+        High topical overlap + diverging/negated content = probable conflict;
+        near-duplicates (high overlap, high cosine, same polarity) score ~0.
+
+        Diagnostic only — never deletes. Needs ``store_text=True`` (nodes
+        without stored text fall back to their title). Candidate generation
+        reuses BM25 with the node's own words as the query, so cost is one
+        search, not O(N²)."""
+        with self._lock:
+            node = self.store.get_node(node_id)
+            if node is None:
+                return []
+            text = self.get_text(node_id) or node.get("title") or ""
+            if not text:
+                return []
+            words = set(w for w in lexical_tokens(
+                text, char_ngrams=(), cross_space=False,
+                suffix_strip=self.cfg.suffix_strip,
+                limit=self.cfg.max_doc_tokens) if len(w) > 1)
+            if not words:
+                return []
+            neg_self = self._has_negation(text)
+            vec_self = self.embedder.embed(text, limit=self.cfg.max_doc_tokens)
+
+            # Candidates: highest lexical overlap via BM25 on our own words.
+            bm25 = bm25_scores(self.store, list(words), doc_lens=self._doclens(),
+                               k1=self.cfg.bm25_k1, b=self.cfg.bm25_b)
+            bm25.pop(node_id, None)
+            cand_ids = top_n(bm25, candidates)
+
+            out: List[Dict[str, Any]] = []
+            for cid in cand_ids:
+                ctext = self.get_text(cid)
+                if ctext is None:
+                    cnode = self.store.get_node(cid)
+                    ctext = (cnode.get("title") if cnode else "") or ""
+                if not ctext:
+                    continue
+                cwords = set(w for w in lexical_tokens(
+                    ctext, char_ngrams=(), cross_space=False,
+                    suffix_strip=self.cfg.suffix_strip,
+                    limit=self.cfg.max_doc_tokens) if len(w) > 1)
+                if not cwords:
+                    continue
+                inter = len(words & cwords)
+                union = len(words | cwords)
+                jaccard = inter / union if union else 0.0
+                if jaccard <= 0.0:
+                    continue
+                cvec = self.embedder.embed(ctext, limit=self.cfg.max_doc_tokens)
+                cos = float(np.dot(vec_self, cvec))
+                divergence = max(0.0, 1.0 - cos)
+                if self._has_negation(ctext) != neg_self:
+                    divergence += 0.5
+                score = jaccard * divergence
+                if score >= min_score:
+                    cnode = self.store.get_node(cid) or {}
+                    out.append({"id": cid, "score": round(score, 4),
+                                "jaccard": round(jaccard, 4),
+                                "cosine": round(cos, 4),
+                                "negation_flip": self._has_negation(ctext) != neg_self,
+                                "title": cnode.get("title", "")})
+            out.sort(key=lambda d: -d["score"])
+            return out[:top_k]
 
     # ── distillation ────────────────────────────────────────────────
     def distill(self, *, epochs: Optional[int] = None) -> Dict[str, Any]:

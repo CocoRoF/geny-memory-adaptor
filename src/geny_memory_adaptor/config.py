@@ -137,6 +137,22 @@ class SynapseConfig:
     #: Exploration: probability of swapping one tail slot with a random candidate.
     epsilon: float = 0.05
 
+    # ── per-item trust (reliability prior, orthogonal to the ranker) ──
+    #: Asymmetric trust updates: confirmed-useful +helpful, explicitly-unhelpful
+    #: −unhelpful (loss-averse — a bad memory should fall faster than a good
+    #: one rises). Trust lives in [0,1], neutral 0.5.
+    trust_helpful: float = 0.05
+    trust_unhelpful: float = 0.10
+    #: Lazy decay of trust TOWARD NEUTRAL with this half-life (days). This is
+    #: the anti-ossification mechanism: reinforcement that is never re-confirmed
+    #: fades back to 0.5 instead of hardening into a permanent belief. 0 = off.
+    trust_half_life_days: float = 45.0
+    #: Score bonus scale: final_score += (effective_trust − 0.5) × 2 × weight,
+    #: i.e. a fully trusted item gains +weight, a fully distrusted one −weight
+    #: (additive — ranker scores can be negative, so a multiplier would invert
+    #: the effect on negatively-scored candidates).
+    trust_weight: float = 2.0
+
     # ── distillation ──
     #: Distillation mini-batch epochs / learning rate (Adam).
     distill_epochs: int = 4
@@ -165,6 +181,14 @@ class SynapseConfig:
             raise ValueError(f"top_k must be ≥ 1, got {self.top_k}")
         if not (0.0 <= self.epsilon <= 1.0):
             raise ValueError(f"epsilon must be in [0, 1], got {self.epsilon}")
+        if not (0.0 <= self.trust_helpful <= 1.0):
+            raise ValueError(f"trust_helpful must be in [0, 1], got {self.trust_helpful}")
+        if not (0.0 <= self.trust_unhelpful <= 1.0):
+            raise ValueError(f"trust_unhelpful must be in [0, 1], got {self.trust_unhelpful}")
+        if not (_m.isfinite(self.trust_half_life_days) and self.trust_half_life_days >= 0):
+            raise ValueError(f"trust_half_life_days must be ≥ 0, got {self.trust_half_life_days}")
+        if not (_m.isfinite(self.trust_weight) and self.trust_weight >= 0):
+            raise ValueError(f"trust_weight must be ≥ 0, got {self.trust_weight}")
 
     @classmethod
     def from_env(cls, *, dotenv: Optional[str] = None, **overrides: Any) -> "SynapseConfig":

@@ -648,3 +648,239 @@ def test_learn_direct_gate_shut_on_noise_and_hebbian_forms():
     mem.learn("multi", positives=[("a", z), ("b", z)], negatives=[z], label_src="edit")
     assert mem.store.get_edge("a", "b", EDGE_COACCESS) is not None
     assert mem.store.get_edge("b", "a", EDGE_COACCESS) is not None
+
+
+# ── A1: per-item trust — effect-proving tests ─────────────────────────
+
+
+def test_trust_unhelpful_drops_rank_and_helpful_raises():
+    """EFFECT PROOF: with two equally-relevant memories, explicit unhelpful
+    feedback must push one below the other; helpful feedback must widen the
+    gap. This is the per-item reliability axis the query-dependent ranker
+    cannot express."""
+    mem = make_mem()
+    mem.index("a", "리듬게임 판정 타이밍과 콤보 시스템", kind="note")
+    mem.index("b", "리듬게임 판정 타이밍과 콤보 시스템", kind="note")  # identical
+
+    def scores():
+        hits = {h.id: h.score for h in mem.search("리듬게임 판정", top_k=5)}
+        return hits["a"], hits["b"]
+
+    a0, b0 = scores()
+    assert abs(a0 - b0) < 0.75  # near-tie at neutral trust
+
+    for _ in range(3):
+        mem.trust_feedback("b", False)   # −0.10 × 3 → trust 0.2
+    for _ in range(4):
+        mem.trust_feedback("a", True)    # +0.05 × 4 → trust ≈ 0.7
+    a1, b1 = scores()
+    assert a1 > b1, "trusted memory must outrank distrusted equal-relevance one"
+    assert (a1 - b1) > (a0 - b0) + 1.0   # the gap is material, not noise
+    # asymmetry: 3 unhelpful moved b further down than 4 helpful moved a up
+    assert (b0 - b1) > (a1 - a0)
+
+
+def test_trust_decays_to_neutral_anti_ossification():
+    """EFFECT PROOF (anti-ossification): trust reinforced long ago and never
+    re-confirmed fades back toward neutral — stale reinforcement cannot
+    permanently pin a memory above equally-relevant peers."""
+    import time as _t
+    mem = make_mem(trust_half_life_days=45.0)
+    mem.index("old", "파이썬 비동기 asyncio 이벤트루프", kind="note")
+    mem.index("new", "파이썬 비동기 asyncio 이벤트루프", kind="note")
+
+    # Heavy reinforcement of "old", but stamped 90 days in the past.
+    past = _t.time() - 90 * 86400
+    for _ in range(8):
+        mem.trust_feedback("old", True, now=past)     # → ~0.9, aged 90d
+    node = mem.store.get_node("old")
+    assert node["trust"] > 0.85
+    # Effective trust NOW: 2 half-lives → 0.5 + 0.4×0.25 = 0.6
+    eff = mem._effective_trust(node, _t.time())
+    assert 0.55 < eff < 0.65, f"expected decay toward neutral, got {eff}"
+
+    # And the same reinforcement applied FRESH is much stronger.
+    for _ in range(8):
+        mem.trust_feedback("new", True)
+    hits = {h.id: h.score for h in mem.search("비동기 이벤트루프", top_k=5)}
+    assert hits["new"] > hits["old"], "fresh confirmation must beat stale"
+
+
+def test_trust_neutral_is_exact_noop_and_weight_zero_disables():
+    """Neutral trust adds exactly 0 — the whole feature is invisible until
+    feedback arrives (MIRACL/eval regression safety by construction)."""
+    m1 = make_mem(trust_weight=0.0, seed=7)
+    m2 = make_mem(trust_weight=2.0, seed=7)
+    for m in (m1, m2):
+        m.index("x", "김치찌개 끓이는 법 돼지고기", kind="note")
+        m.index("y", "리듬게임 콤보 판정", kind="note")
+    s1 = [(h.id, round(h.score, 6)) for h in m1.search("찌개", top_k=3)]
+    s2 = [(h.id, round(h.score, 6)) for h in m2.search("찌개", top_k=3)]
+    assert s1 == s2  # untouched trust (0.5) → identical scores
+
+
+def test_learn_positive_bumps_trust_and_negatives_do_not():
+    mem = make_mem(blend_min_events=40)
+    mem.index("p", "가나다", kind="note")
+    mem.index("n", "라마바", kind="note")
+    z = np.zeros(len(FEATURES), dtype=np.float32)
+    mem.learn("q", positives=[("p", z)], negatives=[z], label_src="edit")
+    assert mem.store.get_node("p")["trust"] > 0.5
+    # negatives are a ranking contrast, NOT distrust evidence
+    assert mem.store.get_node("n")["trust"] == 0.5
+
+
+def test_trust_migration_from_pre_1_5_db(tmp_path):
+    """A vault created before the trust columns opens cleanly: columns are
+    added, existing rows read as neutral 0.5."""
+    import sqlite3
+    dbp = str(tmp_path / "old.db")
+    conn = sqlite3.connect(dbp)
+    conn.execute(
+        "CREATE TABLE nodes(id TEXT PRIMARY KEY, kind TEXT DEFAULT 'note',"
+        " title TEXT DEFAULT '', tags TEXT DEFAULT '[]', text_len INT DEFAULT 0,"
+        " updated_at REAL, access_count INT DEFAULT 0, last_access REAL DEFAULT 0,"
+        " pinned INT DEFAULT 0, importance REAL DEFAULT 1.0)")
+    conn.execute("INSERT INTO nodes(id, updated_at) VALUES('legacy', 0)")
+    conn.commit(); conn.close()
+
+    from geny_memory_adaptor.store import Store
+    st = Store(dbp)
+    node = st.get_node("legacy")
+    assert node is not None
+    assert node["trust"] == 0.5 and node["trust_updated"] == 0.0
+    st.set_trust("legacy", 0.7, 123.0)
+    assert st.get_node("legacy")["trust"] == 0.7
+
+
+# ── A2: contradiction detection — planted-conflict tests ─────────────
+
+
+def test_contradiction_detects_planted_negation_conflicts():
+    """EFFECT PROOF: planted direct contradictions (same topic, flipped
+    polarity) are flagged; paraphrase near-duplicates and unrelated notes
+    are NOT. This is the store-hygiene layer — pure math, no LLM."""
+    mem = make_mem()
+    # planted conflict pair (ko)
+    mem.index("c1", "브라우저 도구는 정상적으로 작동한다. 스크린샷 촬영 가능.", kind="fact")
+    mem.index("c2", "브라우저 도구는 작동하지 않는다. 스크린샷 촬영 불가.", kind="fact")
+    # planted conflict pair (en)
+    mem.index("e1", "the deploy pipeline works fine on staging", kind="fact")
+    mem.index("e2", "the deploy pipeline is broken on staging", kind="fact")
+    # near-duplicate WITHOUT polarity flip — must NOT be flagged
+    mem.index("d1", "김치찌개 레시피: 돼지고기와 두부를 넣고 끓인다", kind="note")
+    mem.index("d2", "김치찌개 레시피: 돼지고기, 두부를 넣어 끓입니다", kind="note")
+    # unrelated
+    mem.index("u1", "리듬게임 콤보 판정 타이밍", kind="note")
+
+    hits = mem.contradictions("c1")
+    ids = [h["id"] for h in hits]
+    assert "c2" in ids, f"planted ko conflict missed: {hits}"
+    assert ids[0] == "c2"
+    assert hits[0]["negation_flip"] is True
+    assert "u1" not in ids and "d1" not in ids
+
+    hits_en = mem.contradictions("e1")
+    assert [h["id"] for h in hits_en][:1] == ["e2"], f"planted en conflict missed: {hits_en}"
+
+    # near-duplicates with the SAME polarity are hygiene-clean
+    dup_hits = mem.contradictions("d1")
+    assert all(h["id"] != "d2" for h in dup_hits), \
+        f"near-duplicate falsely flagged as contradiction: {dup_hits}"
+
+
+def test_contradiction_diagnostic_never_mutates():
+    mem = make_mem()
+    mem.index("a", "도구 X는 사용 가능하다", kind="fact")
+    mem.index("b", "도구 X는 사용 불가능하다", kind="fact")
+    before = mem.store.count_nodes()
+    mem.contradictions("a")
+    assert mem.store.count_nodes() == before
+    assert mem.get_text("b") is not None  # nothing deleted
+
+
+def test_contradiction_unknown_or_textless_node_safe():
+    mem = make_mem(store_text=False)
+    mem.index("x", "본문", title="제목만 있는 노트")
+    assert mem.contradictions("ghost") == []
+    # store_text=False → falls back to title, no crash
+    assert isinstance(mem.contradictions("x"), list)
+
+
+# ── A3: compositional AND-JOIN — effect-proving tests ────────────────
+
+
+def _join_corpus(mem):
+    # partial: covers 결제+인증 RICHLY (2 of 3 entities) — additive fusion's
+    # favourite. Similar length to `complete` so BM25 length-norm is fair.
+    mem.index("partial", "결제 승인과 결제 취소, 결제 환불, 결제 재시도를 "
+              "인증 토큰 발급, 인증 갱신, 인증 세션 관리와 함께 다루는 결제 인증 심화 문서.",
+              kind="note")
+    # complete: touches ALL THREE entities, each only once, similar length.
+    mem.index("complete", "결제 요청 전에 인증 토큰을 검증하고 그 결과를 감사 "
+              "로그 파이프라인에 남기는 연동 지점의 전반 흐름 설계 개요 문서.",
+              kind="note")
+    # noise
+    mem.index("misc", "리듬게임 콤보 판정 타이밍", kind="note")
+
+
+def test_join_and_finds_intersection_where_flat_search_fails():
+    """EFFECT PROOF: for 'what touches 결제 AND 인증 AND 로그?', weakest-link
+    scoring must rank the all-three doc first — while flat additive search
+    ranks the rich two-of-three doc above it (saturated per-term BM25 sums:
+    two strong terms outweigh three weak ones). That mis-ranking is exactly
+    the failure mode min-scoring exists to fix.
+
+    NOTE: an earlier 2-entity version of this corpus did NOT show the flat
+    failure — BM25 term saturation handles two entities fine. The advantage
+    is real only at 3+ entities (or graph-mediated membership), so that is
+    what we test."""
+    mem = make_mem()
+    _join_corpus(mem)
+
+    flat = mem.search("결제 인증 로그", top_k=4)
+    join = mem.search_join(["결제", "인증", "로그"], mode="and", top_k=4)
+
+    # the baseline failure this fixes: flat fusion prefers the 2-of-3-rich doc
+    assert flat and flat[0].id == "partial", \
+        f"corpus no longer demonstrates the flat-search failure: {[(h.id, round(h.score,3)) for h in flat]}"
+    # AND-join gets the intersection right
+    assert join and join[0].id == "complete", \
+        f"AND-join must surface the 3-entity intersection first: {[(h.id, round(h.score,3)) for h in join]}"
+    join_rank = {h.id: i for i, h in enumerate(join)}
+    if "partial" in join_rank:  # reachable via graph hops at best
+        assert join_rank["partial"] > join_rank["complete"]
+    assert "misc" not in join_rank
+
+
+def test_join_or_mode_and_validation():
+    mem = make_mem()
+    _join_corpus(mem)
+    # OR: union + mean semantics — the 2-of-3-rich doc is a fine OR answer
+    ids = [h.id for h in mem.search_join(["결제", "인증", "로그"], mode="or", top_k=5)]
+    assert "partial" in ids and "complete" in ids
+    # AND must be a subset of OR (strictly more selective)
+    and_ids = [h.id for h in mem.search_join(["결제", "인증", "로그"], mode="and", top_k=10)]
+    assert set(and_ids) <= set(
+        h.id for h in mem.search_join(["결제", "인증", "로그"], mode="or", top_k=10))
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        mem.search_join(["결제"], mode="xor")
+    assert mem.search_join([], mode="and") == []
+    assert mem.search_join(["  "], mode="and") == []
+
+
+def test_join_reaches_through_graph_links():
+    """A memory that never mentions an entity verbatim still qualifies via an
+    explicit LINK to one that does — the graph half of the join."""
+    mem = make_mem()
+    mem.index("spec", "인증 프로토콜 표준 명세", kind="note")
+    mem.index("impl", "결제 게이트웨이 구현 노트", kind="note",
+              links=["spec"])  # linked to the 인증 doc, never says 인증
+    mem.index("lonely", "결제 화면 색상 가이드", kind="note")
+
+    hits = mem.search_join(["결제", "인증"], mode="and", top_k=5)
+    ids = [h.id for h in hits]
+    assert "impl" in ids, f"link-mediated membership missed: {ids}"
+    if "lonely" in ids:
+        assert ids.index("impl") < ids.index("lonely")

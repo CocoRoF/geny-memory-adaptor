@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.5.0] — 2026-07-23
+
+Memory governance — three systemic (no-LLM) mechanisms, each gated on an
+effect-proving test before inclusion.
+
+### Added
+- **Per-item trust** (`trust_feedback(node_id, helpful)`): an asymmetric
+  reliability prior (helpful +0.05, unhelpful −0.10, loss-averse) stored per
+  node and applied as an additive score bonus (`trust_weight`). Orthogonal to
+  the query-dependent learned ranker. `learn()`/`feedback()` positives bump
+  trust; ranking negatives do NOT (shown-but-unflagged is contrast, not
+  distrust). Neutral trust (0.5) is an exact score no-op, so untouched vaults
+  are bit-identical (eval-regression safe by construction).
+- **Trust decay to neutral** (`trust_half_life_days`, default 45): lazily
+  decays stored trust TOWARD 0.5 — the anti-ossification mechanism. Stale
+  reinforcement fades unless re-confirmed; fresh confirmation beats old.
+  Schema migration adds `nodes.trust`/`trust_updated` (idempotent
+  ADD COLUMN, safe on live vaults; legacy rows read as neutral).
+- **Contradiction detection** (`contradictions(node_id)`): store-hygiene
+  diagnostic — `word_jaccard × ((1 − cosine) + 0.5·negation_flip)`. The
+  deterministic ko+en negation-marker asymmetry is the primary signal because
+  bag-of-ngram similarity is nearly blind to polarity ("작동한다" vs
+  "작동하지 않는다" cosine-match). Candidates come from one BM25 pass over the
+  node's own words (no O(N²)). Diagnostic only — never mutates.
+- **Compositional entity join** (`search_join(entities, mode="and"|"or")`):
+  weakest-link (min) scoring over per-entity relatedness maps (normalized
+  BM25 ∪ graph-PPR reach, hops discounted 0.8). Fixes the additive-fusion
+  failure where a rich 2-of-3-entity doc outranks the all-three doc; the
+  2-entity case is handled fine by BM25 saturation and is documented as such
+  in the test. LINK-mediated membership works without verbatim mentions.
+
+75 tests green (11 new), MIRACL-ko unchanged.
+
 ## [1.4.0] — 2026-07-21
 
 Closes the learning loop for hosts that have no per-turn feedback seam.
